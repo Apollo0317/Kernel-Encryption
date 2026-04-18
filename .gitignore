@@ -8,3 +8,5 @@
 *.ko
 *.symvers
 *.order
+server/
+*.txt
