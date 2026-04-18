@@ -1,14 +1,11 @@
 
 #include <linux/string.h>
+#include <linux/inet.h>
 #include "nl4_utility.h"
 
 u32 IP2NUM(const char *addr)
 {
-    u8 num[4];
-    int a,b,c,d;
-    sscanf(addr, "%d.%d.%d.%d", &a,&b,&c,&d);
-    num[0]=a; num[1]=b; num[2]=c; num[3]=d;
-    return *(u32 *)num;
+	return in_aton(addr);
 }
 
 inline void NUM2IP(u32 addr, char *str)
@@ -16,32 +13,35 @@ inline void NUM2IP(u32 addr, char *str)
     snprintf(str, 16, "%pI4", &addr);
 }
 
-char get_comp_length(char * data, int len)
+int get_comp_length(char * data, int len)
 {
-	char ex;
+	unsigned int ex;
 	int i = 0;
 
-	ex = data[len - 1]; //the last element
-	if ( (ex&0x0F) == 0)
+	if (len <= 0)
 		return 0;
 
-	for (i = 1; i < ex; i++)
+	ex = (unsigned char)data[len - 1]; //the last element
+	if (ex == 0 || ex > 16 || ex > (unsigned int)len)
+		return 0;
+
+	for (i = 1; i < (int)ex; i++)
 	{
-		if (data[len-1 - i] != 0)
+		if (data[len - 1 - i] != 0)
 			return 0;
 	}
 
-	return ex;
+	return (int)ex;
 }
 
 /***************proto define***************/
 static unsigned int test_skcipher_encdec(struct skcipher_def *sk, int enc);
-static void test_skcipher_cb(struct crypto_async_request *req, int error);
+static void test_skcipher_cb(void *data, int error);
 
 /* Callback function */
-static void test_skcipher_cb(struct crypto_async_request *req, int error)
+static void test_skcipher_cb(void *data, int error)
 {
-	struct tcrypt_result *result = req->data;
+	struct tcrypt_result *result = data;
 
 	if (error == -EINPROGRESS)
 		return;
@@ -91,8 +91,13 @@ int aes_crypto_cipher(	char* data, __u16 data_len,
 	unsigned char key[32];
 	int ret = -EFAULT, i;
 
+	if (data_len == 0)
+		return 0;
+	if (data_len % 16 != 0)
+		return -EINVAL;
+
 	//allocate skcipher handle
-	skcipher = crypto_alloc_skcipher("cbc-aes-aesni", 0, 0);
+	skcipher = crypto_alloc_skcipher("cbc(aes)", 0, 0);
 	if (IS_ERR(skcipher)) {
 		pr_info("could not allocate skcipher handle\n");
 		return PTR_ERR(skcipher);

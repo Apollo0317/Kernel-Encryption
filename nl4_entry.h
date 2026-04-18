@@ -2,6 +2,7 @@
 #define __NL4_ENTRY_H__
 
 #include <linux/string.h>
+#include <linux/netdevice.h>
 #include "nl4_utility.h" //kernel aes_cbc_256
 
 #define REMOTE_IP "127.0.0.1" //FIXME:rewrite to list (with addr mask)

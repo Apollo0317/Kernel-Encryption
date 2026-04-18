@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/types.h>
 #include <linux/version.h>
 //Network Reference
@@ -20,10 +21,139 @@
 #include <linux/inet.h>
 #include <net/ip.h>
 #include <net/tcp.h>
+#include <net/checksum.h>
 
 #include "nl4_entry.h"
 
 static u32 remote_addr = 0;
+static int nl4_debug = 0;
+
+module_param(nl4_debug, int, 0644);
+MODULE_PARM_DESC(nl4_debug, "Enable nl4 debug logging");
+
+static void nl4_log_tcp(const char *tag, struct iphdr *iph,
+			 struct tcphdr *tcph, unsigned int total_len,
+			 unsigned int ip_hdr_len, unsigned int tcp_hdr_len,
+			 unsigned int payload_len, int padding_len,
+			 int tailroom, struct sk_buff *skb)
+{
+	if (!nl4_debug)
+		return;
+	printk(KERN_LOG " %s TCP %pI4:%u -> %pI4:%u seq=%u ack=%u "
+	       "flags=S%dA%dF%dR%dP%d tot=%u ihl=%u thl=%u pay=%u pad=%d "
+	       "skb_len=%u tailroom=%d summed=%u gso=%u\n",
+	       tag,
+	       &iph->saddr, ntohs(tcph->source),
+	       &iph->daddr, ntohs(tcph->dest),
+	       ntohl(tcph->seq), ntohl(tcph->ack_seq),
+	       tcph->syn, tcph->ack, tcph->fin, tcph->rst, tcph->psh,
+	       total_len, ip_hdr_len, tcp_hdr_len, payload_len, padding_len,
+	       skb->len, tailroom, skb->ip_summed, skb_is_gso(skb));
+}
+
+static void nl4_log_tcp_skip(const char *tag, const char *reason,
+			      struct iphdr *iph, struct tcphdr *tcph,
+			      unsigned int total_len, unsigned int ip_hdr_len,
+			      unsigned int tcp_hdr_len, unsigned int payload_len,
+			      struct sk_buff *skb)
+{
+	if (!nl4_debug)
+		return;
+	printk(KERN_LOG " %s TCP skip=%s %pI4:%u -> %pI4:%u seq=%u ack=%u "
+	       "tot=%u ihl=%u thl=%u pay=%u skb_len=%u summed=%u gso=%u\n",
+	       tag, reason,
+	       &iph->saddr, ntohs(tcph->source),
+	       &iph->daddr, ntohs(tcph->dest),
+	       ntohl(tcph->seq), ntohl(tcph->ack_seq),
+	       total_len, ip_hdr_len, tcp_hdr_len, payload_len,
+	       skb->len, skb->ip_summed, skb_is_gso(skb));
+}
+
+static int get_l4_info(struct iphdr *iph, unsigned int total_len,
+				void **l4_hdr, unsigned int *l4_hdr_len)
+{
+	unsigned int ip_hdr_len = iph->ihl * 4;
+
+	if (iph->ihl < 5 || total_len < ip_hdr_len)
+		return -EINVAL;
+
+	switch (iph->protocol) {
+	case IPPROTO_TCP: {
+		struct tcphdr *tcph;
+		unsigned int tcp_hdr_len;
+
+		if (total_len < ip_hdr_len + sizeof(struct tcphdr))
+			return -EINVAL;
+		tcph = (struct tcphdr *)((u8 *)iph + ip_hdr_len);
+		tcp_hdr_len = tcph->doff * 4;
+		if (tcp_hdr_len < sizeof(struct tcphdr))
+			return -EINVAL;
+		if (total_len < ip_hdr_len + tcp_hdr_len)
+			return -EINVAL;
+		*l4_hdr = tcph;
+		*l4_hdr_len = tcp_hdr_len;
+		break;
+	}
+	case IPPROTO_UDP:
+		if (total_len < ip_hdr_len + sizeof(struct udphdr))
+			return -EINVAL;
+		*l4_hdr = (u8 *)iph + ip_hdr_len;
+		*l4_hdr_len = sizeof(struct udphdr);
+		break;
+	case IPPROTO_ICMP:
+		if (total_len < ip_hdr_len + sizeof(struct icmphdr))
+			return -EINVAL;
+		*l4_hdr = (u8 *)iph + ip_hdr_len;
+		*l4_hdr_len = sizeof(struct icmphdr);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static void update_l4_checksum(struct iphdr *iph, void *l4_hdr,
+				      unsigned int l4_len)
+{
+	switch (iph->protocol) {
+	case IPPROTO_TCP: {
+		struct tcphdr *tcph = l4_hdr;
+
+		if (l4_len < sizeof(struct tcphdr))
+			return;
+		tcph->check = 0;
+		tcph->check = tcp_v4_check(l4_len, iph->saddr, iph->daddr,
+					 csum_partial((char *)tcph, l4_len, 0));
+		break;
+	}
+	case IPPROTO_UDP: {
+		struct udphdr *udph = l4_hdr;
+
+		if (l4_len < sizeof(struct udphdr))
+			return;
+		udph->check = 0;
+		udph->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
+					 l4_len, IPPROTO_UDP,
+					 csum_partial((char *)udph, l4_len, 0));
+		if (udph->check == 0)
+			udph->check = CSUM_MANGLED_0;
+		break;
+	}
+	case IPPROTO_ICMP: {
+		struct icmphdr *icmph = l4_hdr;
+
+		if (l4_len < sizeof(struct icmphdr))
+			return;
+		icmph->checksum = 0;
+		icmph->checksum = ip_compute_csum((unsigned char *)icmph,
+						 l4_len);
+		break;
+	}
+	default:
+		break;
+	}
+}
 
 static struct nf_hook_ops nfhk_local_in = 
 {
@@ -54,10 +184,15 @@ unsigned int nf_hookfn_in(void *priv,
 			       struct sk_buff *skb,
 			       const struct nf_hook_state *state)
 {
-	__u16 data_len;
-	char padding_len;
+	unsigned int total_len;
+	unsigned int ip_hdr_len;
+	unsigned int l4_hdr_len;
+	unsigned int data_len;
+	int padding_len;
 	char* payload;
 	struct iphdr *iph = NULL;
+	void *l4_hdr = NULL;
+	int ret;
     // struct tcphdr *tcph = NULL;
 
 	//NOTE: bypass non-linear skb
@@ -68,22 +203,62 @@ unsigned int nf_hookfn_in(void *priv,
 
 	if(iph!=NULL && remoteAllowed(iph, INBOUND))
 	{
-		//a. extract cipher payload
-		data_len = ntohs(iph->tot_len)  - sizeof(struct iphdr);
-		payload = (char *)iph + iph->ihl * 4;
+		total_len = ntohs(iph->tot_len);
+		ip_hdr_len = iph->ihl * 4;
+		if (total_len < ip_hdr_len)
+			return NF_ACCEPT;
+		if (get_l4_info(iph, total_len, &l4_hdr, &l4_hdr_len) != 0)
+			return NF_ACCEPT;
+		if (total_len < ip_hdr_len + l4_hdr_len)
+			return NF_ACCEPT;
+
+		//a. extract cipher payload (exclude L4 header)
+		data_len = total_len - ip_hdr_len - l4_hdr_len;
+		if (data_len == 0) {
+			if (iph->protocol == IPPROTO_TCP)
+				nl4_log_tcp_skip("in", "no-payload", iph, l4_hdr,
+						 total_len, ip_hdr_len, l4_hdr_len,
+						 data_len, skb);
+			return NF_ACCEPT;
+		}
+		if (data_len % 16 != 0) {
+			if (iph->protocol == IPPROTO_TCP)
+				nl4_log_tcp_skip("in", "bad-block-size", iph, l4_hdr,
+						 total_len, ip_hdr_len, l4_hdr_len,
+						 data_len, skb);
+			return NF_ACCEPT;
+		}
+		payload = (char *)l4_hdr + l4_hdr_len;
 
 		//b. decrypt the cipher
-		aes_crypto_cipher(payload, data_len, DECRYPTION);
+		ret = aes_crypto_cipher(payload, data_len, DECRYPTION);
+		if (ret != 0)
+			return NF_ACCEPT;
 		padding_len = get_comp_length(payload, data_len);
-		if(padding_len)
-		{
-			printk("has padding\n");
+		if (iph->protocol == IPPROTO_TCP) {
+			if (padding_len == 0)
+				nl4_log_tcp("in unpadded", iph, l4_hdr, total_len, ip_hdr_len,
+					    l4_hdr_len, data_len, padding_len,
+					    -1, skb);
+			else
+				nl4_log_tcp("in padded", iph, l4_hdr, total_len, ip_hdr_len,
+					    l4_hdr_len, data_len, padding_len,
+					    -1, skb);
+		}
+		if (padding_len > 0 && padding_len <= (int)data_len &&
+		    padding_len <= (int)skb->len) {
 			skb_trim(skb, skb->len - padding_len);
-			// skb->tail -= padding_len; skb->len  -= padding_len;
-			iph->tot_len = htons(ntohs(iph->tot_len) - padding_len);
+			total_len -= padding_len;
+			iph->tot_len = htons(total_len);
+			if (iph->protocol == IPPROTO_UDP) {
+				struct udphdr *udph = l4_hdr;
+				if (ntohs(udph->len) >= padding_len)
+					udph->len = htons(ntohs(udph->len) - padding_len);
+			}
 		}
 
-		//c. re-checksum for iph
+		//c. re-checksum for L4 and IP
+		update_l4_checksum(iph, l4_hdr, total_len - ip_hdr_len);
 		iph->check = 0;
 		iph->check = ip_fast_csum(iph, iph->ihl);
 	}
@@ -95,10 +270,15 @@ unsigned int nf_hookfn_out(void *priv,
 			       struct sk_buff *skb,
 			       const struct nf_hook_state *state)
 {
-	__u16 payload_len;
-	char padding_len;
+	unsigned int total_len;
+	unsigned int ip_hdr_len;
+	unsigned int l4_hdr_len;
+	unsigned int payload_len;
+	int padding_len;
 	char* payload;
 	struct iphdr *iph = NULL;
+	void *l4_hdr = NULL;
+	int ret;
 	// struct tcphdr *tcph = NULL;
 
 	//NOTE: bypass non-linear skb
@@ -109,22 +289,78 @@ unsigned int nf_hookfn_out(void *priv,
 
 	if(iph!=NULL && remoteAllowed(iph, OUTBOUND))
 	{
+		total_len = ntohs(iph->tot_len);
+		ip_hdr_len = iph->ihl * 4;
+		if (total_len < ip_hdr_len)
+			return NF_ACCEPT;
+		if (get_l4_info(iph, total_len, &l4_hdr, &l4_hdr_len) != 0)
+			return NF_ACCEPT;
+		if (total_len < ip_hdr_len + l4_hdr_len)
+			return NF_ACCEPT;
+
 		//a. padding, expand from tailroom
-		payload_len = ntohs(iph->tot_len)  - sizeof(struct iphdr);
-		padding_len = COMP_LENGTH(payload_len);
-
-		//b. encrypt the payload
-		payload = (char *)iph + iph->ihl*4;
-		if(padding_len)
-		{
-			skb_put(skb, padding_len);
-			memset((char *)(payload+payload_len), 0, padding_len);
-			payload[payload_len + padding_len - 1] = padding_len;//ANSI X.923 format
+		payload_len = total_len - ip_hdr_len - l4_hdr_len;
+		if (iph->protocol == IPPROTO_TCP) {
+			if (payload_len == 0) {
+				nl4_log_tcp_skip("out", "no-payload", iph, l4_hdr,
+						 total_len, ip_hdr_len, l4_hdr_len,
+						 payload_len, skb);
+				return NF_ACCEPT;
+			}
+			padding_len = COMP_LENGTH(payload_len);
+		} else {
+			padding_len = COMP_LENGTH(payload_len);
 		}
-		aes_crypto_cipher(payload, (payload_len+padding_len), ENCRYPTION);
+		if (iph->protocol == IPPROTO_TCP) {
+			int tailroom_before = skb_tailroom(skb);
 
-		//c. re-checksum for iph
-		iph->tot_len = htons(ntohs(iph->tot_len) + padding_len);
+			if (padding_len > 0)
+				nl4_log_tcp("out padded", iph, l4_hdr, total_len, ip_hdr_len,
+					    l4_hdr_len, payload_len, padding_len,
+					    tailroom_before, skb);
+			else
+				nl4_log_tcp("out unpadded", iph, l4_hdr, total_len, ip_hdr_len,
+					    l4_hdr_len, payload_len, padding_len,
+					    tailroom_before, skb);
+		}
+		if (padding_len > 0) {
+			int tailroom = skb_tailroom(skb);
+			int needed = padding_len - tailroom;
+
+			if (needed > 0) {
+				if (pskb_expand_head(skb, 0, needed, GFP_ATOMIC) != 0)
+					return NF_ACCEPT;
+				iph = ip_hdr(skb);
+				if (!iph)
+					return NF_ACCEPT;
+				total_len = ntohs(iph->tot_len);
+				ip_hdr_len = iph->ihl * 4;
+				if (get_l4_info(iph, total_len, &l4_hdr, &l4_hdr_len) != 0)
+					return NF_ACCEPT;
+				if (total_len < ip_hdr_len + l4_hdr_len)
+					return NF_ACCEPT;
+			}
+		}
+
+		//b. encrypt the payload (exclude L4 header)
+		payload = (char *)l4_hdr + l4_hdr_len;
+		if (padding_len > 0) {
+			skb_put(skb, padding_len);
+			memset((char *)(payload + payload_len), 0, padding_len);
+			payload[payload_len + padding_len - 1] = padding_len;//ANSI X.923 format
+			total_len += padding_len;
+			iph->tot_len = htons(total_len);
+			if (iph->protocol == IPPROTO_UDP) {
+				struct udphdr *udph = l4_hdr;
+				udph->len = htons(ntohs(udph->len) + padding_len);
+			}
+		}
+		ret = aes_crypto_cipher(payload, payload_len + padding_len, ENCRYPTION);
+		if (ret != 0)
+			return NF_ACCEPT;
+
+		//c. re-checksum for L4 and IP
+		update_l4_checksum(iph, l4_hdr, total_len - ip_hdr_len);
 		iph->check = 0;
 		iph->check = ip_fast_csum(iph, iph->ihl);
 	}

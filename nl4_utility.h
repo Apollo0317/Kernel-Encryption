@@ -41,7 +41,7 @@ struct skcipher_def {
 u32 IP2NUM(const char *addr);
 inline void NUM2IP(u32 addr, char *str);
 
-char get_comp_length(char * data, int len);
+int get_comp_length(char * data, int len);
 
 int aes_crypto_cipher(char *, __u16, int);
 

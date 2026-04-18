@@ -1,0 +1,1 @@
+savedcmd_/home/apollo/free/Project/Netfilter-L4-Encryption/Module.symvers :=  scripts/mod/modpost -M -m       -o /home/apollo/free/Project/Netfilter-L4-Encryption/Module.symvers -T /home/apollo/free/Project/Netfilter-L4-Encryption/modules.order -i Module.symvers -e 
