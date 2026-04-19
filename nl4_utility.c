@@ -1,6 +1,7 @@
 
 #include <linux/string.h>
 #include <linux/inet.h>
+#include <linux/slab.h>
 #include "nl4_utility.h"
 
 u32 IP2NUM(const char *addr)
@@ -13,30 +14,10 @@ inline void NUM2IP(u32 addr, char *str)
     snprintf(str, 16, "%pI4", &addr);
 }
 
-int get_comp_length(char * data, int len)
-{
-	unsigned int ex;
-	int i = 0;
-
-	if (len <= 0)
-		return 0;
-
-	ex = (unsigned char)data[len - 1]; //the last element
-	if (ex == 0 || ex > 16 || ex > (unsigned int)len)
-		return 0;
-
-	for (i = 1; i < (int)ex; i++)
-	{
-		if (data[len - 1 - i] != 0)
-			return 0;
-	}
-
-	return (int)ex;
-}
-
 /***************proto define***************/
 static unsigned int test_skcipher_encdec(struct skcipher_def *sk, int enc);
 static void test_skcipher_cb(void *data, int error);
+static struct crypto_skcipher *nl4_alloc_stream_cipher(void);
 
 /* Callback function */
 static void test_skcipher_cb(void *data, int error)
@@ -81,70 +62,74 @@ static unsigned int test_skcipher_encdec(struct skcipher_def *sk,
 	return rc;
 }
 
-int aes_crypto_cipher(	char* data, __u16 data_len,
-						int enc) 
+static struct crypto_skcipher *nl4_alloc_stream_cipher(void)
+{
+	struct crypto_skcipher *skcipher;
+
+	skcipher = crypto_alloc_skcipher("chacha20", 0, 0);
+	if (!IS_ERR(skcipher))
+		return skcipher;
+
+	pr_info("chacha20 unavailable, falling back to ctr(aes)\n");
+	return crypto_alloc_skcipher("ctr(aes)", 0, 0);
+}
+
+int nl4_crypto_cipher(char *data, __u16 data_len, int enc)
 {
 	struct skcipher_def sk;
 	struct crypto_skcipher *skcipher = NULL;
 	struct skcipher_request *req = NULL;
 	char *ivdata = NULL;
 	unsigned char key[32];
-	int ret = -EFAULT, i;
+	unsigned int ivsize;
+	int ret = -EFAULT;
 
 	if (data_len == 0)
 		return 0;
-	if (data_len % 16 != 0)
-		return -EINVAL;
 
-	//allocate skcipher handle
-	skcipher = crypto_alloc_skcipher("cbc(aes)", 0, 0);
+	/* Prefer a true stream cipher and keep payload length unchanged. */
+	skcipher = nl4_alloc_stream_cipher();
 	if (IS_ERR(skcipher)) {
-		pr_info("could not allocate skcipher handle\n");
+		pr_info("could not allocate stream cipher handle\n");
 		return PTR_ERR(skcipher);
 	}
-	//allocate skcipher request
+
 	req = skcipher_request_alloc(skcipher, GFP_KERNEL);
 	if (!req) {
 		pr_info("could not allocate skcipher request\n");
 		ret = -ENOMEM;
 		goto out;
 	}
-	//set callback for request
-	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, \
-				      test_skcipher_cb, \
+
+	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				      test_skcipher_cb,
 				      &sk.result);
 
-	/* AES 256 with certain key */
-	memset(key, 1, 32);//FULL 'F'
-	/*get_random_bytes(&key, 32);*/
+	memset(key, 1, sizeof(key));
 	if (crypto_skcipher_setkey(skcipher, key, 32)) {
 		pr_info("key could not be set\n");
 		ret = -EAGAIN;
 		goto out;
 	}
 
-	/* IV will be all 0 */
-	ivdata = kmalloc(16, GFP_KERNEL);
-	if (!ivdata) {
+	ivsize = crypto_skcipher_ivsize(skcipher);
+	if (ivsize != 0) {
+		ivdata = kzalloc(ivsize, GFP_KERNEL);
+	}
+	if (ivsize != 0 && !ivdata) {
 		pr_info("could not allocate ivdata\n");
+		ret = -ENOMEM;
 		goto out;
 	}
-	memset(ivdata, 0, 16);
-	/*get_random_bytes(ivdata, 16);*/
 
 	sk.tfm = skcipher;
 	sk.req = req;
+	sk.result.err = 0;
+	init_completion(&sk.result.completion);
 
-	for (i = 0; i < data_len/16; i++)
-	{
-		/* We encrypt one block */
-		sg_init_one(&sk.sg, data + i*16, 16);//sg_init_table(&sgl, data_len/16);
-		skcipher_request_set_crypt(req, &sk.sg, &sk.sg, 16, ivdata);
-		init_completion(&sk.result.completion);
-
-		/* encrypt data */
-		ret = test_skcipher_encdec(&sk, enc);
-	}
+	sg_init_one(&sk.sg, data, data_len);
+	skcipher_request_set_crypt(req, &sk.sg, &sk.sg, data_len, ivdata);
+	ret = test_skcipher_encdec(&sk, enc);
 	
 out:
 	if (skcipher)

@@ -11,7 +11,6 @@
 
 #define ENCRYPTION	0x1
 #define DECRYPTION	0x0
-#define COMP_LENGTH(x) ((16-x%16)&0x0F)
 
 #define INBOUND     0x0
 #define OUTBOUND    0x1
@@ -41,8 +40,6 @@ struct skcipher_def {
 u32 IP2NUM(const char *addr);
 inline void NUM2IP(u32 addr, char *str);
 
-int get_comp_length(char * data, int len);
-
-int aes_crypto_cipher(char *, __u16, int);
+int nl4_crypto_cipher(char *, __u16, int);
 
 #endif

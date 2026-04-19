@@ -3,7 +3,7 @@
 
 #include <linux/string.h>
 #include <linux/netdevice.h>
-#include "nl4_utility.h" //kernel aes_cbc_256
+#include "nl4_utility.h" // kernel Crypto API helper
 
 #define REMOTE_IP "127.0.0.1" //FIXME:rewrite to list (with addr mask)
 

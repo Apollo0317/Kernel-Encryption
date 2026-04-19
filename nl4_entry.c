@@ -188,16 +188,15 @@ unsigned int nf_hookfn_in(void *priv,
 	unsigned int ip_hdr_len;
 	unsigned int l4_hdr_len;
 	unsigned int data_len;
-	int padding_len;
 	char* payload;
 	struct iphdr *iph = NULL;
 	void *l4_hdr = NULL;
 	int ret;
     // struct tcphdr *tcph = NULL;
 
-	//NOTE: bypass non-linear skb
-	if (unlikely(skb_linearize(skb) != 0))
-        return NF_ACCEPT;
+	/* Only linearize when the skb payload is fragmented. */
+	if (skb_is_nonlinear(skb) && unlikely(skb_linearize(skb) != 0))
+		return NF_ACCEPT;
 
 	iph = ip_hdr(skb);
 
@@ -221,41 +220,15 @@ unsigned int nf_hookfn_in(void *priv,
 						 data_len, skb);
 			return NF_ACCEPT;
 		}
-		if (data_len % 16 != 0) {
-			if (iph->protocol == IPPROTO_TCP)
-				nl4_log_tcp_skip("in", "bad-block-size", iph, l4_hdr,
-						 total_len, ip_hdr_len, l4_hdr_len,
-						 data_len, skb);
-			return NF_ACCEPT;
-		}
 		payload = (char *)l4_hdr + l4_hdr_len;
 
-		//b. decrypt the cipher
-		ret = aes_crypto_cipher(payload, data_len, DECRYPTION);
+		/* Stream cipher decrypts in place without changing payload length. */
+		ret = nl4_crypto_cipher(payload, data_len, DECRYPTION);
 		if (ret != 0)
 			return NF_ACCEPT;
-		padding_len = get_comp_length(payload, data_len);
-		if (iph->protocol == IPPROTO_TCP) {
-			if (padding_len == 0)
-				nl4_log_tcp("in unpadded", iph, l4_hdr, total_len, ip_hdr_len,
-					    l4_hdr_len, data_len, padding_len,
-					    -1, skb);
-			else
-				nl4_log_tcp("in padded", iph, l4_hdr, total_len, ip_hdr_len,
-					    l4_hdr_len, data_len, padding_len,
-					    -1, skb);
-		}
-		if (padding_len > 0 && padding_len <= (int)data_len &&
-		    padding_len <= (int)skb->len) {
-			skb_trim(skb, skb->len - padding_len);
-			total_len -= padding_len;
-			iph->tot_len = htons(total_len);
-			if (iph->protocol == IPPROTO_UDP) {
-				struct udphdr *udph = l4_hdr;
-				if (ntohs(udph->len) >= padding_len)
-					udph->len = htons(ntohs(udph->len) - padding_len);
-			}
-		}
+		if (iph->protocol == IPPROTO_TCP)
+			nl4_log_tcp("in stream", iph, l4_hdr, total_len, ip_hdr_len,
+				    l4_hdr_len, data_len, 0, -1, skb);
 
 		//c. re-checksum for L4 and IP
 		update_l4_checksum(iph, l4_hdr, total_len - ip_hdr_len);
@@ -274,16 +247,15 @@ unsigned int nf_hookfn_out(void *priv,
 	unsigned int ip_hdr_len;
 	unsigned int l4_hdr_len;
 	unsigned int payload_len;
-	int padding_len;
 	char* payload;
 	struct iphdr *iph = NULL;
 	void *l4_hdr = NULL;
 	int ret;
 	// struct tcphdr *tcph = NULL;
 
-	//NOTE: bypass non-linear skb
-	if (unlikely(skb_linearize(skb) != 0))
-        return NF_ACCEPT;
+	/* Only linearize when the skb payload is fragmented. */
+	if (skb_is_nonlinear(skb) && unlikely(skb_linearize(skb) != 0))
+		return NF_ACCEPT;
 
 	iph = ip_hdr(skb);
 
@@ -298,64 +270,23 @@ unsigned int nf_hookfn_out(void *priv,
 		if (total_len < ip_hdr_len + l4_hdr_len)
 			return NF_ACCEPT;
 
-		//a. padding, expand from tailroom
+		//a. encrypt payload in place without resizing skb
 		payload_len = total_len - ip_hdr_len - l4_hdr_len;
-		if (iph->protocol == IPPROTO_TCP) {
-			if (payload_len == 0) {
+		if (payload_len == 0) {
+			if (iph->protocol == IPPROTO_TCP)
 				nl4_log_tcp_skip("out", "no-payload", iph, l4_hdr,
 						 total_len, ip_hdr_len, l4_hdr_len,
 						 payload_len, skb);
-				return NF_ACCEPT;
-			}
-			padding_len = COMP_LENGTH(payload_len);
-		} else {
-			padding_len = COMP_LENGTH(payload_len);
+			return NF_ACCEPT;
 		}
-		if (iph->protocol == IPPROTO_TCP) {
-			int tailroom_before = skb_tailroom(skb);
+		if (iph->protocol == IPPROTO_TCP)
+			nl4_log_tcp("out stream", iph, l4_hdr, total_len, ip_hdr_len,
+				    l4_hdr_len, payload_len, 0,
+				    skb_tailroom(skb), skb);
 
-			if (padding_len > 0)
-				nl4_log_tcp("out padded", iph, l4_hdr, total_len, ip_hdr_len,
-					    l4_hdr_len, payload_len, padding_len,
-					    tailroom_before, skb);
-			else
-				nl4_log_tcp("out unpadded", iph, l4_hdr, total_len, ip_hdr_len,
-					    l4_hdr_len, payload_len, padding_len,
-					    tailroom_before, skb);
-		}
-		if (padding_len > 0) {
-			int tailroom = skb_tailroom(skb);
-			int needed = padding_len - tailroom;
-
-			if (needed > 0) {
-				if (pskb_expand_head(skb, 0, needed, GFP_ATOMIC) != 0)
-					return NF_ACCEPT;
-				iph = ip_hdr(skb);
-				if (!iph)
-					return NF_ACCEPT;
-				total_len = ntohs(iph->tot_len);
-				ip_hdr_len = iph->ihl * 4;
-				if (get_l4_info(iph, total_len, &l4_hdr, &l4_hdr_len) != 0)
-					return NF_ACCEPT;
-				if (total_len < ip_hdr_len + l4_hdr_len)
-					return NF_ACCEPT;
-			}
-		}
-
-		//b. encrypt the payload (exclude L4 header)
+		/* Stream cipher keeps total_len and iph->tot_len unchanged. */
 		payload = (char *)l4_hdr + l4_hdr_len;
-		if (padding_len > 0) {
-			skb_put(skb, padding_len);
-			memset((char *)(payload + payload_len), 0, padding_len);
-			payload[payload_len + padding_len - 1] = padding_len;//ANSI X.923 format
-			total_len += padding_len;
-			iph->tot_len = htons(total_len);
-			if (iph->protocol == IPPROTO_UDP) {
-				struct udphdr *udph = l4_hdr;
-				udph->len = htons(ntohs(udph->len) + padding_len);
-			}
-		}
-		ret = aes_crypto_cipher(payload, payload_len + padding_len, ENCRYPTION);
+		ret = nl4_crypto_cipher(payload, payload_len, ENCRYPTION);
 		if (ret != 0)
 			return NF_ACCEPT;
 
