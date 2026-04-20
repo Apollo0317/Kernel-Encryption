@@ -313,7 +313,7 @@ static int nl4_init(void)
 
 	ret = nf_register_net_hook(&init_net, &nfhk_local_out);
 	if (ret < 0) {
-        printk("OUTBOUND Moudle Register Error.\n");
+        printk("OUTBOUND Module Register Error.\n");
         return ret;
     }
 
@@ -329,6 +329,6 @@ static void nl4_fini(void)
 }
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Mark-PC");
+MODULE_AUTHOR("Apollo");
 module_init(nl4_init);
 module_exit(nl4_fini);
