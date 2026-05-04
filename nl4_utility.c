@@ -2,6 +2,11 @@
 #include <linux/string.h>
 #include <linux/inet.h>
 #include <linux/slab.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/jhash.h>
+#include <asm/unaligned.h>
+#include <crypto/chacha.h>
 #include "nl4_utility.h"
 
 u32 IP2NUM(const char *addr)
@@ -18,6 +23,9 @@ inline void NUM2IP(u32 addr, char *str)
 static unsigned int test_skcipher_encdec(struct skcipher_def *sk, int enc);
 static void test_skcipher_cb(void *data, int error);
 static struct crypto_skcipher *nl4_alloc_stream_cipher(void);
+static int nl4_skcipher_crypt(char *data, unsigned int data_len, int enc,
+			      const char *cipher_name, const u8 *iv,
+			      unsigned int expected_ivsize);
 
 /* Callback function */
 static void test_skcipher_cb(void *data, int error)
@@ -49,10 +57,14 @@ static unsigned int test_skcipher_encdec(struct skcipher_def *sk,
 	case -EBUSY:
 		rc = wait_for_completion_interruptible(
 			&sk->result.completion);
-		if (!rc && !sk->result.err) {
-			reinit_completion(&sk->result.completion);
+		if (rc)
+			break;
+		if (sk->result.err) {
+			rc = sk->result.err;
 			break;
 		}
+		reinit_completion(&sk->result.completion);
+		break;
 	default:
 		//pr_info("skcipher encrypt returned with %d result %d\n", rc, sk->result.err);
 		break;
@@ -74,7 +86,9 @@ static struct crypto_skcipher *nl4_alloc_stream_cipher(void)
 	return crypto_alloc_skcipher("ctr(aes)", 0, 0);
 }
 
-int nl4_crypto_cipher(char *data, __u16 data_len, int enc)
+static int nl4_skcipher_crypt(char *data, unsigned int data_len, int enc,
+			      const char *cipher_name, const u8 *iv,
+			      unsigned int expected_ivsize)
 {
 	struct skcipher_def sk;
 	struct crypto_skcipher *skcipher = NULL;
@@ -87,8 +101,11 @@ int nl4_crypto_cipher(char *data, __u16 data_len, int enc)
 	if (data_len == 0)
 		return 0;
 
-	/* Prefer a true stream cipher and keep payload length unchanged. */
-	skcipher = nl4_alloc_stream_cipher();
+	if (cipher_name)
+		skcipher = crypto_alloc_skcipher(cipher_name, 0, 0);
+	else
+		/* Prefer a true stream cipher and keep payload length unchanged. */
+		skcipher = nl4_alloc_stream_cipher();
 	if (IS_ERR(skcipher)) {
 		pr_info("could not allocate stream cipher handle\n");
 		return PTR_ERR(skcipher);
@@ -113,6 +130,11 @@ int nl4_crypto_cipher(char *data, __u16 data_len, int enc)
 	}
 
 	ivsize = crypto_skcipher_ivsize(skcipher);
+	if (expected_ivsize && ivsize != expected_ivsize) {
+		pr_info("unexpected ivsize %u for %s\n", ivsize, cipher_name);
+		ret = -EINVAL;
+		goto out;
+	}
 	if (ivsize != 0) {
 		ivdata = kzalloc(ivsize, GFP_KERNEL);
 	}
@@ -121,6 +143,8 @@ int nl4_crypto_cipher(char *data, __u16 data_len, int enc)
 		ret = -ENOMEM;
 		goto out;
 	}
+	if (iv && ivsize)
+		memcpy(ivdata, iv, ivsize);
 
 	sk.tfm = skcipher;
 	sk.req = req;
@@ -138,5 +162,62 @@ out:
 		skcipher_request_free(req);
 	if (ivdata)
 		kfree(ivdata);
+	return ret;
+}
+
+int nl4_crypto_cipher(char *data, __u16 data_len, int enc)
+{
+	return nl4_skcipher_crypt(data, data_len, enc, NULL, NULL, 0);
+}
+
+int nl4_tcp_crypto_cipher(char *data, unsigned int data_len,
+			  const struct iphdr *iph, const struct tcphdr *tcph,
+			  int enc)
+{
+	u8 iv[CHACHA_IV_SIZE];
+	char *buf;
+	u32 tuple[5];
+	u32 nonce[3];
+	u32 tcp_seq;
+	u32 block_index;
+	unsigned int skip;
+	unsigned int crypt_len;
+	int ret;
+
+	if (data_len == 0)
+		return 0;
+
+	tcp_seq = ntohl(tcph->seq);
+	block_index = tcp_seq / CHACHA_BLOCK_SIZE;
+	skip = tcp_seq % CHACHA_BLOCK_SIZE;
+	crypt_len = data_len + skip;
+
+	buf = kmalloc(crypt_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	memset(buf, 0, skip);
+	memcpy(buf + skip, data, data_len);
+
+	tuple[0] = (__force u32)iph->saddr;
+	tuple[1] = (__force u32)iph->daddr;
+	tuple[2] = ((__force u32)tcph->source << 16) | (__force u32)tcph->dest;
+	tuple[3] = iph->protocol;
+	tuple[4] = 0x4e4c3454;
+	nonce[0] = jhash2(tuple, ARRAY_SIZE(tuple), 0x6e6c3461);
+	nonce[1] = jhash2(tuple, ARRAY_SIZE(tuple), 0x6e6c3462);
+	nonce[2] = jhash2(tuple, ARRAY_SIZE(tuple), 0x6e6c3463);
+
+	put_unaligned_le32(block_index, iv);
+	put_unaligned_le32(nonce[0], iv + 4);
+	put_unaligned_le32(nonce[1], iv + 8);
+	put_unaligned_le32(nonce[2], iv + 12);
+
+	ret = nl4_skcipher_crypt(buf, crypt_len, enc, "chacha20", iv,
+				 CHACHA_IV_SIZE);
+	if (ret == 0)
+		memcpy(data, buf + skip, data_len);
+
+	kfree(buf);
 	return ret;
 }

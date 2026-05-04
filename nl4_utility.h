@@ -5,6 +5,9 @@
 #include <linux/scatterlist.h>
 #include <linux/err.h>
 
+struct iphdr;
+struct tcphdr;
+
 #define KEYWORD "[nl4-aes]"
 #define KERN_LOG KERN_NOTICE KEYWORD
 #define printh(x) printk(KERN_LOG x)
@@ -14,6 +17,7 @@
 
 #define INBOUND     0x0
 #define OUTBOUND    0x1
+#define NL4_TCP_STREAM_BLOCK_SIZE 64
 #define IPV4A(x)   ((u8 *)x)[0]
 #define IPV4B(x)   ((u8 *)x)[1]
 #define IPV4C(x)   ((u8 *)x)[2]
@@ -41,5 +45,7 @@ u32 IP2NUM(const char *addr);
 inline void NUM2IP(u32 addr, char *str);
 
 int nl4_crypto_cipher(char *, __u16, int);
+int nl4_tcp_crypto_cipher(char *, unsigned int, const struct iphdr *,
+			  const struct tcphdr *, int);
 
 #endif

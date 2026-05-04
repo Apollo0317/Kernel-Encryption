@@ -32,23 +32,29 @@ module_param(nl4_debug, int, 0644);
 MODULE_PARM_DESC(nl4_debug, "Enable nl4 debug logging");
 
 static void nl4_log_tcp(const char *tag, struct iphdr *iph,
-			 struct tcphdr *tcph, unsigned int total_len,
+	struct tcphdr *tcph, unsigned int total_len,
 			 unsigned int ip_hdr_len, unsigned int tcp_hdr_len,
 			 unsigned int payload_len, int padding_len,
 			 int tailroom, struct sk_buff *skb)
 {
+	u32 seq = ntohl(tcph->seq);
+	u32 block_index = seq / NL4_TCP_STREAM_BLOCK_SIZE;
+	unsigned int skip = seq % NL4_TCP_STREAM_BLOCK_SIZE;
+
 	if (!nl4_debug)
 		return;
 	printk(KERN_LOG " %s TCP %pI4:%u -> %pI4:%u seq=%u ack=%u "
 	       "flags=S%dA%dF%dR%dP%d tot=%u ihl=%u thl=%u pay=%u pad=%d "
-	       "skb_len=%u tailroom=%d summed=%u gso=%u\n",
+	       "block=%u skip=%u skb_len=%u tailroom=%d summed=%u gso=%u "
+	       "checksum=recompute\n",
 	       tag,
 	       &iph->saddr, ntohs(tcph->source),
 	       &iph->daddr, ntohs(tcph->dest),
-	       ntohl(tcph->seq), ntohl(tcph->ack_seq),
+	       seq, ntohl(tcph->ack_seq),
 	       tcph->syn, tcph->ack, tcph->fin, tcph->rst, tcph->psh,
 	       total_len, ip_hdr_len, tcp_hdr_len, payload_len, padding_len,
-	       skb->len, tailroom, skb->ip_summed, skb_is_gso(skb));
+	       block_index, skip, skb->len, tailroom, skb->ip_summed,
+	       skb_is_gso(skb));
 }
 
 static void nl4_log_tcp_skip(const char *tag, const char *reason,
@@ -155,6 +161,28 @@ static void update_l4_checksum(struct iphdr *iph, void *l4_hdr,
 	}
 }
 
+static int nl4_prepare_skb(struct sk_buff *skb)
+{
+	unsigned int total_len;
+	struct iphdr *iph;
+
+	if (skb_is_gso(skb))
+		return -EOPNOTSUPP;
+
+	if (skb_is_nonlinear(skb) && unlikely(skb_linearize(skb) != 0))
+		return -ENOMEM;
+
+	iph = ip_hdr(skb);
+	if (!iph)
+		return -EINVAL;
+
+	total_len = ntohs(iph->tot_len);
+	if (unlikely(skb_ensure_writable(skb, total_len) != 0))
+		return -ENOMEM;
+
+	return 0;
+}
+
 static struct nf_hook_ops nfhk_local_in = 
 {
 	.hook = nf_hookfn_in,
@@ -191,17 +219,27 @@ unsigned int nf_hookfn_in(void *priv,
 	char* payload;
 	struct iphdr *iph = NULL;
 	void *l4_hdr = NULL;
+	u8 proto;
 	int ret;
     // struct tcphdr *tcph = NULL;
 
-	/* Only linearize when the skb payload is fragmented. */
-	if (skb_is_nonlinear(skb) && unlikely(skb_linearize(skb) != 0))
+	iph = ip_hdr(skb);
+	if (iph == NULL || !remoteAllowed(iph, INBOUND))
 		return NF_ACCEPT;
+	proto = iph->protocol;
+
+	ret = nl4_prepare_skb(skb);
+	if (ret != 0) {
+		if (proto == IPPROTO_TCP) {
+			printk(KERN_LOG " in TCP skb prepare failed ret=%d, drop\n",
+			       ret);
+			return NF_DROP;
+		}
+		return NF_ACCEPT;
+	}
 
 	iph = ip_hdr(skb);
-
-	if(iph!=NULL && remoteAllowed(iph, INBOUND))
-	{
+	if (iph != NULL) {
 		total_len = ntohs(iph->tot_len);
 		ip_hdr_len = iph->ihl * 4;
 		if (total_len < ip_hdr_len)
@@ -223,12 +261,21 @@ unsigned int nf_hookfn_in(void *priv,
 		payload = (char *)l4_hdr + l4_hdr_len;
 
 		/* Stream cipher decrypts in place without changing payload length. */
-		ret = nl4_crypto_cipher(payload, data_len, DECRYPTION);
-		if (ret != 0)
-			return NF_ACCEPT;
-		if (iph->protocol == IPPROTO_TCP)
+		if (iph->protocol == IPPROTO_TCP) {
+			ret = nl4_tcp_crypto_cipher(payload, data_len, iph, l4_hdr,
+						    DECRYPTION);
+			if (ret != 0) {
+				printk(KERN_LOG " in TCP crypto failed ret=%d, drop\n",
+				       ret);
+				return NF_DROP;
+			}
 			nl4_log_tcp("in stream", iph, l4_hdr, total_len, ip_hdr_len,
 				    l4_hdr_len, data_len, 0, -1, skb);
+		} else {
+			ret = nl4_crypto_cipher(payload, data_len, DECRYPTION);
+			if (ret != 0)
+				return NF_ACCEPT;
+		}
 
 		//c. re-checksum for L4 and IP
 		update_l4_checksum(iph, l4_hdr, total_len - ip_hdr_len);
@@ -250,17 +297,27 @@ unsigned int nf_hookfn_out(void *priv,
 	char* payload;
 	struct iphdr *iph = NULL;
 	void *l4_hdr = NULL;
+	u8 proto;
 	int ret;
 	// struct tcphdr *tcph = NULL;
 
-	/* Only linearize when the skb payload is fragmented. */
-	if (skb_is_nonlinear(skb) && unlikely(skb_linearize(skb) != 0))
+	iph = ip_hdr(skb);
+	if (iph == NULL || !remoteAllowed(iph, OUTBOUND))
 		return NF_ACCEPT;
+	proto = iph->protocol;
+
+	ret = nl4_prepare_skb(skb);
+	if (ret != 0) {
+		if (proto == IPPROTO_TCP) {
+			printk(KERN_LOG " out TCP skb prepare failed ret=%d, drop\n",
+			       ret);
+			return NF_DROP;
+		}
+		return NF_ACCEPT;
+	}
 
 	iph = ip_hdr(skb);
-
-	if(iph!=NULL && remoteAllowed(iph, OUTBOUND))
-	{
+	if (iph != NULL) {
 		total_len = ntohs(iph->tot_len);
 		ip_hdr_len = iph->ihl * 4;
 		if (total_len < ip_hdr_len)
@@ -286,9 +343,19 @@ unsigned int nf_hookfn_out(void *priv,
 
 		/* Stream cipher keeps total_len and iph->tot_len unchanged. */
 		payload = (char *)l4_hdr + l4_hdr_len;
-		ret = nl4_crypto_cipher(payload, payload_len, ENCRYPTION);
-		if (ret != 0)
-			return NF_ACCEPT;
+		if (iph->protocol == IPPROTO_TCP) {
+			ret = nl4_tcp_crypto_cipher(payload, payload_len, iph,
+						    l4_hdr, ENCRYPTION);
+			if (ret != 0) {
+				printk(KERN_LOG " out TCP crypto failed ret=%d, drop\n",
+				       ret);
+				return NF_DROP;
+			}
+		} else {
+			ret = nl4_crypto_cipher(payload, payload_len, ENCRYPTION);
+			if (ret != 0)
+				return NF_ACCEPT;
+		}
 
 		//c. re-checksum for L4 and IP
 		update_l4_checksum(iph, l4_hdr, total_len - ip_hdr_len);
@@ -314,6 +381,7 @@ static int nl4_init(void)
 	ret = nf_register_net_hook(&init_net, &nfhk_local_out);
 	if (ret < 0) {
         printk("OUTBOUND Module Register Error.\n");
+		nf_unregister_net_hook(&init_net, &nfhk_local_in);
         return ret;
     }
 
