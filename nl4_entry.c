@@ -1,5 +1,5 @@
 /**
- * @Author: Mark Hong
+ * @Author: Mark Hong, Apollo
 */
 
 //Moudle reference
@@ -28,9 +28,12 @@
 #include "nl4_entry.h"
 
 static u32 remote_addr = 0;
+static int encrypt_port = 0;
 static int nl4_debug = 0;
 static int nl4_perf = 0;
 
+module_param(encrypt_port, int, 0644);
+MODULE_PARM_DESC(encrypt_port, "TCP service port to encrypt/decrypt, 0 means all ports");
 module_param(nl4_debug, int, 0644);
 MODULE_PARM_DESC(nl4_debug, "Enable nl4 debug logging");
 module_param(nl4_perf, int, 0644);
@@ -50,6 +53,7 @@ struct nl4_perf_stats {
 	atomic64_t gso_drop;
 	atomic64_t nonlinear_count;
 	atomic64_t ensure_writable_fail_count;
+	atomic64_t port_mismatch;
 };
 
 static struct nl4_perf_stats nl4_perf_in;
@@ -84,7 +88,7 @@ static void nl4_perf_print_one(const char *tag, struct nl4_perf_stats *stats)
 	       "prepare_ns=%llu crypto_ns=%llu checksum_ns=%llu "
 	       "gso_seen=%llu gso_encrypt_ok=%llu gso_bad_csum_mode=%llu "
 	       "gso_prepare_fail=%llu gso_drop=%llu nonlinear=%llu "
-	       "writable_fail=%llu\n",
+	       "writable_fail=%llu port_mismatch=%llu\n",
 	       tag,
 	       atomic64_read(&stats->packets),
 	       atomic64_read(&stats->bytes),
@@ -98,7 +102,53 @@ static void nl4_perf_print_one(const char *tag, struct nl4_perf_stats *stats)
 	       atomic64_read(&stats->gso_prepare_fail),
 	       atomic64_read(&stats->gso_drop),
 	       atomic64_read(&stats->nonlinear_count),
-	       atomic64_read(&stats->ensure_writable_fail_count));
+	       atomic64_read(&stats->ensure_writable_fail_count),
+	       atomic64_read(&stats->port_mismatch));
+}
+
+static int nl4_tcp_port_matches(const struct tcphdr *tcph)
+{
+	__be16 port;
+
+	if (encrypt_port == 0)
+		return 1;
+
+	port = htons((u16)encrypt_port);
+	return tcph->source == port || tcph->dest == port;
+}
+
+static int nl4_tcp_port_allowed(struct nl4_perf_stats *stats,
+				const struct tcphdr *tcph)
+{
+	if (nl4_tcp_port_matches(tcph))
+		return 1;
+
+	nl4_perf_inc(&stats->port_mismatch);
+	return 0;
+}
+
+static int nl4_tcp_skb_port_allowed(struct sk_buff *skb, struct iphdr *iph,
+				    struct nl4_perf_stats *stats)
+{
+	unsigned int total_len;
+	unsigned int ip_hdr_len;
+	struct tcphdr _tcph;
+	struct tcphdr *tcph;
+
+	if (encrypt_port == 0 || iph->protocol != IPPROTO_TCP)
+		return 1;
+
+	total_len = ntohs(iph->tot_len);
+	ip_hdr_len = iph->ihl * 4;
+	if (iph->ihl < 5 || total_len < ip_hdr_len + sizeof(struct tcphdr))
+		return 1;
+
+	tcph = skb_header_pointer(skb, skb_network_offset(skb) + ip_hdr_len,
+				  sizeof(_tcph), &_tcph);
+	if (!tcph)
+		return 1;
+
+	return nl4_tcp_port_allowed(stats, tcph);
 }
 
 static void nl4_log_tcp(const char *tag, struct iphdr *iph,
@@ -329,6 +379,9 @@ static int nl4_tcp_gso_fast_path(struct sk_buff *skb,
 		return -EINVAL;
 	}
 
+	if (!nl4_tcp_port_allowed(stats, tcph))
+		return 0;
+
 	payload_len = total_len - ip_hdr_len - tcp_hdr_len;
 	if (payload_len == 0) {
 		nl4_log_tcp_skip(tag, "gso-no-payload", iph, tcph, total_len,
@@ -398,6 +451,9 @@ unsigned int nf_hookfn_in(void *priv,
 	if (iph == NULL || !remoteAllowed(iph, INBOUND))
 		goto out_accept;
 	proto = iph->protocol;
+	if (proto == IPPROTO_TCP && !skb_is_gso(skb) &&
+	    !nl4_tcp_skb_port_allowed(skb, iph, &nl4_perf_in))
+		goto out_accept;
 
 	if (proto == IPPROTO_TCP && skb_is_gso(skb)) {
 		step_start = nl4_perf_now();
@@ -437,6 +493,9 @@ unsigned int nf_hookfn_in(void *priv,
 		if (get_l4_info(iph, total_len, &l4_hdr, &l4_hdr_len) != 0)
 			goto out_accept;
 		if (total_len < ip_hdr_len + l4_hdr_len)
+			goto out_accept;
+		if (iph->protocol == IPPROTO_TCP &&
+		    !nl4_tcp_port_allowed(&nl4_perf_in, l4_hdr))
 			goto out_accept;
 
 		//a. extract cipher payload (exclude L4 header)
@@ -507,6 +566,9 @@ unsigned int nf_hookfn_out(void *priv,
 	if (iph == NULL || !remoteAllowed(iph, OUTBOUND))
 		goto out_accept;
 	proto = iph->protocol;
+	if (proto == IPPROTO_TCP && !skb_is_gso(skb) &&
+	    !nl4_tcp_skb_port_allowed(skb, iph, &nl4_perf_out))
+		goto out_accept;
 
 	if (proto == IPPROTO_TCP && skb_is_gso(skb)) {
 		step_start = nl4_perf_now();
@@ -546,6 +608,9 @@ unsigned int nf_hookfn_out(void *priv,
 		if (get_l4_info(iph, total_len, &l4_hdr, &l4_hdr_len) != 0)
 			goto out_accept;
 		if (total_len < ip_hdr_len + l4_hdr_len)
+			goto out_accept;
+		if (iph->protocol == IPPROTO_TCP &&
+		    !nl4_tcp_port_allowed(&nl4_perf_out, l4_hdr))
 			goto out_accept;
 
 		//a. encrypt payload in place without resizing skb
