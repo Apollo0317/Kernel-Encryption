@@ -5,6 +5,8 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/jhash.h>
+#include <linux/percpu.h>
+#include <linux/spinlock.h>
 #include <asm/unaligned.h>
 #include <crypto/chacha.h>
 #include "nl4_utility.h"
@@ -26,6 +28,18 @@ static struct crypto_skcipher *nl4_alloc_stream_cipher(void);
 static int nl4_skcipher_crypt(char *data, unsigned int data_len, int enc,
 			      const char *cipher_name, const u8 *iv,
 			      unsigned int expected_ivsize);
+
+struct nl4_tcp_crypto_ctx {
+	struct skcipher_request *req;
+	struct scatterlist sg;
+	struct tcrypt_result result;
+	u8 iv[CHACHA_IV_SIZE];
+	u8 *scratch;
+	spinlock_t lock;
+};
+
+static struct crypto_skcipher *nl4_tcp_skcipher;
+static DEFINE_PER_CPU(struct nl4_tcp_crypto_ctx, nl4_tcp_ctx);
 
 /* Callback function */
 static void test_skcipher_cb(void *data, int error)
@@ -70,6 +84,36 @@ static unsigned int test_skcipher_encdec(struct skcipher_def *sk,
 		break;
 	}
 	init_completion(&sk->result.completion);
+
+	return rc;
+}
+
+static int nl4_tcp_skcipher_crypt(struct nl4_tcp_crypto_ctx *ctx,
+				  unsigned int crypt_len, int enc)
+{
+	int rc;
+
+	ctx->result.err = 0;
+	init_completion(&ctx->result.completion);
+	sg_init_one(&ctx->sg, ctx->scratch, crypt_len);
+	skcipher_request_set_crypt(ctx->req, &ctx->sg, &ctx->sg, crypt_len,
+				   ctx->iv);
+
+	if (enc)
+		rc = crypto_skcipher_encrypt(ctx->req);
+	else
+		rc = crypto_skcipher_decrypt(ctx->req);
+
+	switch (rc) {
+	case 0:
+		break;
+	case -EINPROGRESS:
+	case -EBUSY:
+		rc = -EAGAIN;
+		break;
+	default:
+		break;
+	}
 
 	return rc;
 }
@@ -174,30 +218,34 @@ int nl4_tcp_crypto_cipher(char *data, unsigned int data_len,
 			  const struct iphdr *iph, const struct tcphdr *tcph,
 			  int enc)
 {
-	u8 iv[CHACHA_IV_SIZE];
-	char *buf;
+	struct nl4_tcp_crypto_ctx *ctx;
 	u32 tuple[5];
 	u32 nonce[3];
 	u32 tcp_seq;
 	u32 block_index;
 	unsigned int skip;
 	unsigned int crypt_len;
+	unsigned int cpu;
 	int ret;
 
 	if (data_len == 0)
 		return 0;
+	if (!nl4_tcp_skcipher)
+		return -ENODEV;
 
 	tcp_seq = ntohl(tcph->seq);
 	block_index = tcp_seq / CHACHA_BLOCK_SIZE;
 	skip = tcp_seq % CHACHA_BLOCK_SIZE;
 	crypt_len = data_len + skip;
+	if (unlikely(crypt_len > NL4_TCP_SCRATCH_SIZE))
+		return -EMSGSIZE;
 
-	buf = kmalloc(crypt_len, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	memset(buf, 0, skip);
-	memcpy(buf + skip, data, data_len);
+	cpu = get_cpu();
+	ctx = per_cpu_ptr(&nl4_tcp_ctx, cpu);
+	put_cpu();
+	spin_lock_bh(&ctx->lock);
+	memset(ctx->scratch, 0, skip);
+	memcpy(ctx->scratch + skip, data, data_len);
 
 	tuple[0] = (__force u32)iph->saddr;
 	tuple[1] = (__force u32)iph->daddr;
@@ -208,16 +256,92 @@ int nl4_tcp_crypto_cipher(char *data, unsigned int data_len,
 	nonce[1] = jhash2(tuple, ARRAY_SIZE(tuple), 0x6e6c3462);
 	nonce[2] = jhash2(tuple, ARRAY_SIZE(tuple), 0x6e6c3463);
 
-	put_unaligned_le32(block_index, iv);
-	put_unaligned_le32(nonce[0], iv + 4);
-	put_unaligned_le32(nonce[1], iv + 8);
-	put_unaligned_le32(nonce[2], iv + 12);
+	put_unaligned_le32(block_index, ctx->iv);
+	put_unaligned_le32(nonce[0], ctx->iv + 4);
+	put_unaligned_le32(nonce[1], ctx->iv + 8);
+	put_unaligned_le32(nonce[2], ctx->iv + 12);
 
-	ret = nl4_skcipher_crypt(buf, crypt_len, enc, "chacha20", iv,
-				 CHACHA_IV_SIZE);
+	ret = nl4_tcp_skcipher_crypt(ctx, crypt_len, enc);
 	if (ret == 0)
-		memcpy(data, buf + skip, data_len);
+		memcpy(data, ctx->scratch + skip, data_len);
 
-	kfree(buf);
+	spin_unlock_bh(&ctx->lock);
 	return ret;
+}
+
+int nl4_crypto_init(void)
+{
+	unsigned char key[CHACHA_KEY_SIZE];
+	unsigned int cpu;
+	int ret = 0;
+
+	nl4_tcp_skcipher = crypto_alloc_skcipher("chacha20", 0,
+						 CRYPTO_ALG_ASYNC);
+	if (IS_ERR(nl4_tcp_skcipher)) {
+		ret = PTR_ERR(nl4_tcp_skcipher);
+		pr_err("could not allocate TCP chacha20 handle: %d\n", ret);
+		nl4_tcp_skcipher = NULL;
+		return ret;
+	}
+
+	if (crypto_skcipher_ivsize(nl4_tcp_skcipher) != CHACHA_IV_SIZE) {
+		pr_err("unexpected TCP chacha20 ivsize %u\n",
+		       crypto_skcipher_ivsize(nl4_tcp_skcipher));
+		ret = -EINVAL;
+		goto err;
+	}
+
+	memset(key, 1, sizeof(key));
+	ret = crypto_skcipher_setkey(nl4_tcp_skcipher, key, sizeof(key));
+	if (ret) {
+		pr_err("could not set TCP chacha20 key: %d\n", ret);
+		goto err;
+	}
+
+	for_each_possible_cpu(cpu) {
+		struct nl4_tcp_crypto_ctx *ctx = per_cpu_ptr(&nl4_tcp_ctx, cpu);
+
+		spin_lock_init(&ctx->lock);
+		ctx->scratch = kmalloc(NL4_TCP_SCRATCH_SIZE, GFP_KERNEL);
+		if (!ctx->scratch) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		ctx->req = skcipher_request_alloc(nl4_tcp_skcipher, GFP_KERNEL);
+		if (!ctx->req) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		skcipher_request_set_callback(ctx->req,
+					      CRYPTO_TFM_REQ_MAY_BACKLOG,
+					      test_skcipher_cb, &ctx->result);
+		init_completion(&ctx->result.completion);
+	}
+
+	return 0;
+
+err:
+	nl4_crypto_exit();
+	return ret;
+}
+
+void nl4_crypto_exit(void)
+{
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct nl4_tcp_crypto_ctx *ctx = per_cpu_ptr(&nl4_tcp_ctx, cpu);
+
+		if (ctx->req) {
+			skcipher_request_free(ctx->req);
+			ctx->req = NULL;
+		}
+		kfree(ctx->scratch);
+		ctx->scratch = NULL;
+	}
+
+	if (nl4_tcp_skcipher) {
+		crypto_free_skcipher(nl4_tcp_skcipher);
+		nl4_tcp_skcipher = NULL;
+	}
 }

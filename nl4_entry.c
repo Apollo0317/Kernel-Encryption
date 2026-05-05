@@ -231,8 +231,9 @@ unsigned int nf_hookfn_in(void *priv,
 	ret = nl4_prepare_skb(skb);
 	if (ret != 0) {
 		if (proto == IPPROTO_TCP) {
-			printk(KERN_LOG " in TCP skb prepare failed ret=%d, drop\n",
-			       ret);
+			printk_ratelimited(KERN_LOG
+					   " in TCP skb prepare failed ret=%d, drop\n",
+					   ret);
 			return NF_DROP;
 		}
 		return NF_ACCEPT;
@@ -265,8 +266,9 @@ unsigned int nf_hookfn_in(void *priv,
 			ret = nl4_tcp_crypto_cipher(payload, data_len, iph, l4_hdr,
 						    DECRYPTION);
 			if (ret != 0) {
-				printk(KERN_LOG " in TCP crypto failed ret=%d, drop\n",
-				       ret);
+				printk_ratelimited(KERN_LOG
+						   " in TCP crypto failed ret=%d, drop\n",
+						   ret);
 				return NF_DROP;
 			}
 			nl4_log_tcp("in stream", iph, l4_hdr, total_len, ip_hdr_len,
@@ -309,8 +311,9 @@ unsigned int nf_hookfn_out(void *priv,
 	ret = nl4_prepare_skb(skb);
 	if (ret != 0) {
 		if (proto == IPPROTO_TCP) {
-			printk(KERN_LOG " out TCP skb prepare failed ret=%d, drop\n",
-			       ret);
+			printk_ratelimited(KERN_LOG
+					   " out TCP skb prepare failed ret=%d, drop\n",
+					   ret);
 			return NF_DROP;
 		}
 		return NF_ACCEPT;
@@ -347,8 +350,9 @@ unsigned int nf_hookfn_out(void *priv,
 			ret = nl4_tcp_crypto_cipher(payload, payload_len, iph,
 						    l4_hdr, ENCRYPTION);
 			if (ret != 0) {
-				printk(KERN_LOG " out TCP crypto failed ret=%d, drop\n",
-				       ret);
+				printk_ratelimited(KERN_LOG
+						   " out TCP crypto failed ret=%d, drop\n",
+						   ret);
 				return NF_DROP;
 			}
 		} else {
@@ -372,9 +376,16 @@ static int nl4_init(void)
 
 	remote_addr = IP2NUM(REMOTE_IP);
 
+	ret = nl4_crypto_init();
+	if (ret < 0) {
+		printk(KERN_LOG "Crypto Init Error.\n");
+		return ret;
+	}
+
 	ret = nf_register_net_hook(&init_net, &nfhk_local_in);
 	if (ret < 0) {
         printk("INBOUND Module Register Error.\n");
+		nl4_crypto_exit();
         return ret;
     }
 
@@ -382,6 +393,7 @@ static int nl4_init(void)
 	if (ret < 0) {
         printk("OUTBOUND Module Register Error.\n");
 		nf_unregister_net_hook(&init_net, &nfhk_local_in);
+		nl4_crypto_exit();
         return ret;
     }
 
@@ -393,6 +405,7 @@ static void nl4_fini(void)
 {
 	nf_unregister_net_hook(&init_net, &nfhk_local_in);
 	nf_unregister_net_hook(&init_net, &nfhk_local_out);
+	nl4_crypto_exit();
 	printh("NL4 Suite Exit ...\n");
 }
 
