@@ -18,7 +18,6 @@ struct tcphdr;
 #define INBOUND     0x0
 #define OUTBOUND    0x1
 #define NL4_TCP_STREAM_BLOCK_SIZE 64
-#define NL4_TCP_SCRATCH_SIZE (65535 + NL4_TCP_STREAM_BLOCK_SIZE)
 #define IPV4A(x)   ((u8 *)x)[0]
 #define IPV4B(x)   ((u8 *)x)[1]
 #define IPV4C(x)   ((u8 *)x)[2]
