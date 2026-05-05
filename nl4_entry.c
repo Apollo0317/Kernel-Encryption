@@ -43,7 +43,11 @@ struct nl4_perf_stats {
 	atomic64_t prepare_ns;
 	atomic64_t crypto_ns;
 	atomic64_t checksum_ns;
-	atomic64_t gso_count;
+	atomic64_t gso_seen;
+	atomic64_t gso_encrypt_ok;
+	atomic64_t gso_bad_csum_mode;
+	atomic64_t gso_prepare_fail;
+	atomic64_t gso_drop;
 	atomic64_t nonlinear_count;
 	atomic64_t ensure_writable_fail_count;
 };
@@ -77,8 +81,10 @@ static inline void nl4_perf_add_count(atomic64_t *counter, u64 value)
 static void nl4_perf_print_one(const char *tag, struct nl4_perf_stats *stats)
 {
 	printk(KERN_LOG " PERF %s packets=%llu bytes=%llu hook_ns=%llu "
-	       "prepare_ns=%llu crypto_ns=%llu checksum_ns=%llu gso=%llu "
-	       "nonlinear=%llu writable_fail=%llu\n",
+	       "prepare_ns=%llu crypto_ns=%llu checksum_ns=%llu "
+	       "gso_seen=%llu gso_encrypt_ok=%llu gso_bad_csum_mode=%llu "
+	       "gso_prepare_fail=%llu gso_drop=%llu nonlinear=%llu "
+	       "writable_fail=%llu\n",
 	       tag,
 	       atomic64_read(&stats->packets),
 	       atomic64_read(&stats->bytes),
@@ -86,7 +92,11 @@ static void nl4_perf_print_one(const char *tag, struct nl4_perf_stats *stats)
 	       atomic64_read(&stats->prepare_ns),
 	       atomic64_read(&stats->crypto_ns),
 	       atomic64_read(&stats->checksum_ns),
-	       atomic64_read(&stats->gso_count),
+	       atomic64_read(&stats->gso_seen),
+	       atomic64_read(&stats->gso_encrypt_ok),
+	       atomic64_read(&stats->gso_bad_csum_mode),
+	       atomic64_read(&stats->gso_prepare_fail),
+	       atomic64_read(&stats->gso_drop),
 	       atomic64_read(&stats->nonlinear_count),
 	       atomic64_read(&stats->ensure_writable_fail_count));
 }
@@ -226,11 +236,6 @@ static int nl4_prepare_skb(struct sk_buff *skb, struct nl4_perf_stats *stats)
 	unsigned int total_len;
 	struct iphdr *iph;
 
-	if (skb_is_gso(skb)) {
-		nl4_perf_inc(&stats->gso_count);
-		return -EOPNOTSUPP;
-	}
-
 	if (skb_is_nonlinear(skb)) {
 		nl4_perf_inc(&stats->nonlinear_count);
 		if (unlikely(skb_linearize(skb) != 0))
@@ -247,6 +252,103 @@ static int nl4_prepare_skb(struct sk_buff *skb, struct nl4_perf_stats *stats)
 		return -ENOMEM;
 	}
 
+	return 0;
+}
+
+static int nl4_tcp_gso_fast_path(struct sk_buff *skb,
+				 struct nl4_perf_stats *stats,
+				 int enc, const char *tag)
+{
+	unsigned int total_len;
+	unsigned int ip_hdr_len;
+	unsigned int tcp_hdr_len;
+	unsigned int payload_len;
+	struct iphdr *iph;
+	struct tcphdr *tcph;
+	char *payload;
+	int ret;
+
+	nl4_perf_inc(&stats->gso_seen);
+
+	if (skb->ip_summed != CHECKSUM_PARTIAL) {
+		nl4_perf_inc(&stats->gso_bad_csum_mode);
+		nl4_perf_inc(&stats->gso_drop);
+		return -EINVAL;
+	}
+
+	iph = ip_hdr(skb);
+	if (!iph || iph->protocol != IPPROTO_TCP) {
+		nl4_perf_inc(&stats->gso_drop);
+		return -EINVAL;
+	}
+
+	total_len = ntohs(iph->tot_len);
+	ip_hdr_len = iph->ihl * 4;
+	if (iph->ihl < 5 || total_len < ip_hdr_len + sizeof(struct tcphdr)) {
+		nl4_perf_inc(&stats->gso_drop);
+		return -EINVAL;
+	}
+
+	if (skb_is_nonlinear(skb)) {
+		nl4_perf_inc(&stats->nonlinear_count);
+		if (unlikely(skb_linearize(skb) != 0)) {
+			nl4_perf_inc(&stats->gso_prepare_fail);
+			nl4_perf_inc(&stats->gso_drop);
+			return -ENOMEM;
+		}
+	}
+
+	if (unlikely(skb_ensure_writable(skb, total_len) != 0)) {
+		nl4_perf_inc(&stats->ensure_writable_fail_count);
+		nl4_perf_inc(&stats->gso_prepare_fail);
+		nl4_perf_inc(&stats->gso_drop);
+		return -ENOMEM;
+	}
+
+	iph = ip_hdr(skb);
+	if (!iph || iph->protocol != IPPROTO_TCP) {
+		nl4_perf_inc(&stats->gso_prepare_fail);
+		nl4_perf_inc(&stats->gso_drop);
+		return -EINVAL;
+	}
+
+	total_len = ntohs(iph->tot_len);
+	ip_hdr_len = iph->ihl * 4;
+	if (iph->ihl < 5 || total_len < ip_hdr_len + sizeof(struct tcphdr)) {
+		nl4_perf_inc(&stats->gso_prepare_fail);
+		nl4_perf_inc(&stats->gso_drop);
+		return -EINVAL;
+	}
+
+	tcph = (struct tcphdr *)((u8 *)iph + ip_hdr_len);
+	tcp_hdr_len = tcph->doff * 4;
+	if (tcp_hdr_len < sizeof(struct tcphdr) ||
+	    total_len < ip_hdr_len + tcp_hdr_len) {
+		nl4_perf_inc(&stats->gso_prepare_fail);
+		nl4_perf_inc(&stats->gso_drop);
+		return -EINVAL;
+	}
+
+	payload_len = total_len - ip_hdr_len - tcp_hdr_len;
+	if (payload_len == 0) {
+		nl4_log_tcp_skip(tag, "gso-no-payload", iph, tcph, total_len,
+				 ip_hdr_len, tcp_hdr_len, payload_len, skb);
+		nl4_perf_inc(&stats->gso_encrypt_ok);
+		return 0;
+	}
+
+	payload = (char *)tcph + tcp_hdr_len;
+	nl4_perf_inc(&stats->packets);
+	nl4_perf_add_count(&stats->bytes, payload_len);
+	ret = nl4_tcp_crypto_cipher(payload, payload_len, iph, tcph, enc);
+	if (ret != 0) {
+		nl4_perf_inc(&stats->gso_drop);
+		return ret;
+	}
+
+	nl4_perf_inc(&stats->gso_encrypt_ok);
+	nl4_log_tcp(tag, iph, tcph, total_len, ip_hdr_len, tcp_hdr_len,
+		    payload_len, 0, skb_tailroom(skb), skb);
 	return 0;
 }
 
@@ -296,6 +398,21 @@ unsigned int nf_hookfn_in(void *priv,
 	if (iph == NULL || !remoteAllowed(iph, INBOUND))
 		goto out_accept;
 	proto = iph->protocol;
+
+	if (proto == IPPROTO_TCP && skb_is_gso(skb)) {
+		step_start = nl4_perf_now();
+		ret = nl4_tcp_gso_fast_path(skb, &nl4_perf_in, DECRYPTION,
+					    "in gso stream");
+		nl4_perf_add_ns(&nl4_perf_in.crypto_ns, step_start);
+		if (ret != 0) {
+			printk_ratelimited(KERN_LOG
+					   " in TCP GSO fast path failed ret=%d, drop\n",
+					   ret);
+			nl4_perf_add_ns(&nl4_perf_in.hook_ns, hook_start);
+			return NF_DROP;
+		}
+		goto out_accept;
+	}
 
 	step_start = nl4_perf_now();
 	ret = nl4_prepare_skb(skb, &nl4_perf_in);
@@ -390,6 +507,21 @@ unsigned int nf_hookfn_out(void *priv,
 	if (iph == NULL || !remoteAllowed(iph, OUTBOUND))
 		goto out_accept;
 	proto = iph->protocol;
+
+	if (proto == IPPROTO_TCP && skb_is_gso(skb)) {
+		step_start = nl4_perf_now();
+		ret = nl4_tcp_gso_fast_path(skb, &nl4_perf_out, ENCRYPTION,
+					    "out gso stream");
+		nl4_perf_add_ns(&nl4_perf_out.crypto_ns, step_start);
+		if (ret != 0) {
+			printk_ratelimited(KERN_LOG
+					   " out TCP GSO fast path failed ret=%d, drop\n",
+					   ret);
+			nl4_perf_add_ns(&nl4_perf_out.hook_ns, hook_start);
+			return NF_DROP;
+		}
+		goto out_accept;
+	}
 
 	step_start = nl4_perf_now();
 	ret = nl4_prepare_skb(skb, &nl4_perf_out);
