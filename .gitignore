@@ -24,3 +24,6 @@ modules.order
 # Local generated dirs
 .cache/
 server/
+
+.codex
+compile_commands.json
