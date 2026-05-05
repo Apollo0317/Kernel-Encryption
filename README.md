@@ -15,16 +15,17 @@ Just imagine that the intermediate routers could not know what you are actually 
 ## Runtime options
 
 The kernel module keeps the current hardcoded peer address and key, but can
-limit TCP payload encryption to one service port:
+limit TCP payload encryption/decryption to one TCP service port:
 
 ```sh
 sudo insmod nl4_bypass.ko encrypt_port=8081
 ```
 
 `encrypt_port=0` is the default and processes all TCP ports for the configured
-peer. `encrypt_port=N` only processes TCP traffic where the source or
-destination port equals `N`. For remote SSH management, use a demo service port
-such as `8081` or `8082` so SSH port `22` is bypassed.
+peer. `encrypt_port=N` only applies to TCP traffic where the source or
+destination port equals `N`; non-TCP handling is unchanged. For remote SSH
+management, use a demo service port such as `8081` or `8082` so SSH port `22`
+is bypassed.
 
 ## TODO
 

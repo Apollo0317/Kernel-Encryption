@@ -379,9 +379,6 @@ static int nl4_tcp_gso_fast_path(struct sk_buff *skb,
 		return -EINVAL;
 	}
 
-	if (!nl4_tcp_port_allowed(stats, tcph))
-		return 0;
-
 	payload_len = total_len - ip_hdr_len - tcp_hdr_len;
 	if (payload_len == 0) {
 		nl4_log_tcp_skip(tag, "gso-no-payload", iph, tcph, total_len,
@@ -451,7 +448,7 @@ unsigned int nf_hookfn_in(void *priv,
 	if (iph == NULL || !remoteAllowed(iph, INBOUND))
 		goto out_accept;
 	proto = iph->protocol;
-	if (proto == IPPROTO_TCP && !skb_is_gso(skb) &&
+	if (proto == IPPROTO_TCP &&
 	    !nl4_tcp_skb_port_allowed(skb, iph, &nl4_perf_in))
 		goto out_accept;
 
@@ -566,7 +563,7 @@ unsigned int nf_hookfn_out(void *priv,
 	if (iph == NULL || !remoteAllowed(iph, OUTBOUND))
 		goto out_accept;
 	proto = iph->protocol;
-	if (proto == IPPROTO_TCP && !skb_is_gso(skb) &&
+	if (proto == IPPROTO_TCP &&
 	    !nl4_tcp_skb_port_allowed(skb, iph, &nl4_perf_out))
 		goto out_accept;
 
@@ -665,6 +662,12 @@ out_accept:
 static int nl4_init(void)
 {
 	unsigned int ret;
+
+	if (encrypt_port < 0 || encrypt_port > 65535) {
+		printk(KERN_LOG "invalid encrypt_port=%d, expected 0-65535\n",
+		       encrypt_port);
+		return -EINVAL;
+	}
 
 	remote_addr = IP2NUM(REMOTE_IP);
 
