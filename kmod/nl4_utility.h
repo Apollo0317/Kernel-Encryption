@@ -46,7 +46,7 @@ inline void NUM2IP(u32 addr, char *str);
 
 int nl4_crypto_cipher(char *, __u16, int);
 int nl4_tcp_crypto_cipher(char *, unsigned int, const struct iphdr *,
-			  const struct tcphdr *, int);
+			  const struct tcphdr *, const u32[8], int);
 int nl4_crypto_init(void);
 void nl4_crypto_exit(void);
 

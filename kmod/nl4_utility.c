@@ -8,7 +8,6 @@
 #include <linux/percpu.h>
 #include <linux/bottom_half.h>
 #include <linux/minmax.h>
-#include <asm/unaligned.h>
 #include <crypto/chacha.h>
 #include "nl4_utility.h"
 
@@ -34,7 +33,6 @@ struct nl4_tcp_crypto_ctx {
 	u8 stream[CHACHA_BLOCK_SIZE];
 };
 
-static u32 nl4_tcp_chacha_key[CHACHA_KEY_SIZE / sizeof(u32)];
 static DEFINE_PER_CPU(struct nl4_tcp_crypto_ctx, nl4_tcp_ctx);
 
 /* Callback function */
@@ -182,6 +180,7 @@ int nl4_crypto_cipher(char *data, __u16 data_len, int enc)
 
 int nl4_tcp_crypto_cipher(char *data, unsigned int data_len,
 			  const struct iphdr *iph, const struct tcphdr *tcph,
+			  const u32 key_words[CHACHA_KEY_SIZE / sizeof(u32)],
 			  int enc)
 {
 	struct nl4_tcp_crypto_ctx *ctx;
@@ -210,7 +209,7 @@ int nl4_tcp_crypto_cipher(char *data, unsigned int data_len,
 	nonce[2] = jhash2(tuple, ARRAY_SIZE(tuple), 0x6e6c3463);
 
 	chacha_init_consts(state);
-	memcpy(&state[4], nl4_tcp_chacha_key, sizeof(nl4_tcp_chacha_key));
+	memcpy(&state[4], key_words, CHACHA_KEY_SIZE);
 	state[12] = block_index;
 	state[13] = nonce[0];
 	state[14] = nonce[1];
@@ -237,14 +236,6 @@ int nl4_tcp_crypto_cipher(char *data, unsigned int data_len,
 
 int nl4_crypto_init(void)
 {
-	unsigned char key[CHACHA_KEY_SIZE];
-	unsigned int i;
-
-	memset(key, 1, sizeof(key));
-	for (i = 0; i < ARRAY_SIZE(nl4_tcp_chacha_key); i++)
-		nl4_tcp_chacha_key[i] =
-			get_unaligned_le32(key + i * sizeof(u32));
-
 	return 0;
 }
 

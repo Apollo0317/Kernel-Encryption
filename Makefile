@@ -1,32 +1,21 @@
 
-MOD=nl4_bypass
-
-ifneq ($(KERNELRELEASE),)
-	obj-m := $(MOD).o
-	$(MOD)-objs := nl4_entry.o nl4_utility.o
-else
-	PWD := $(shell pwd)
-	KDIR := /lib/modules/$(shell uname -r)/build
-
-all:build-krn build-usr
+all: build-krn build-usr
 
 build-krn:
-	$(MAKE) -C $(KDIR) M=$(PWD)
+	$(MAKE) -C kmod
 
 build-usr:
-	@echo "ERROR: No Userspace Program Found."
+	$(MAKE) -C app
 
 install:
-	cp -f $(MOD).ko /lib/modules/$(shell uname -r)
+	$(MAKE) -C kmod install
 
 insmod:
-	sudo insmod $(MOD).ko
+	$(MAKE) -C kmod insmod
 
 rmmod:
-	sudo rmmod $(MOD)
+	$(MAKE) -C kmod rmmod
 
 clean:
-	rm -f .cache.mk .*.cmd
-	rm -f *.o *.o.cmd *.ko *.mod.c *.symvers *.order
-	rm -rf .tmp_versions
-endif
+	$(MAKE) -C kmod clean
+	$(MAKE) -C app clean

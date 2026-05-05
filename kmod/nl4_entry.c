@@ -11,6 +11,9 @@
 #include <linux/version.h>
 #include <linux/ktime.h>
 #include <linux/atomic.h>
+#include <linux/mutex.h>
+#include <linux/rculist.h>
+#include <linux/list.h>
 //Network Reference
 #include <linux/inetdevice.h>
 #include <linux/skbuff.h>
@@ -24,16 +27,14 @@
 #include <net/ip.h>
 #include <net/tcp.h>
 #include <net/checksum.h>
+#include <net/genetlink.h>
 
 #include "nl4_entry.h"
+#include <nl4_netlink.h>
 
-static u32 remote_addr = 0;
-static int encrypt_port = 0;
 static int nl4_debug = 0;
 static int nl4_perf = 0;
 
-module_param(encrypt_port, int, 0644);
-MODULE_PARM_DESC(encrypt_port, "TCP service port to encrypt/decrypt, 0 means all ports");
 module_param(nl4_debug, int, 0644);
 MODULE_PARM_DESC(nl4_debug, "Enable nl4 debug logging");
 module_param(nl4_perf, int, 0644);
@@ -58,6 +59,27 @@ struct nl4_perf_stats {
 
 static struct nl4_perf_stats nl4_perf_in;
 static struct nl4_perf_stats nl4_perf_out;
+
+struct nl4_rule {
+	struct list_head list;
+	struct rcu_head rcu;
+	__be32 remote_ip;
+	__be16 service_port;
+	u8 service_side;
+	u32 shared_key_words[NL4_SHARED_KEY_WORDS];
+};
+
+static LIST_HEAD(nl4_rule_list);
+static DEFINE_MUTEX(nl4_rule_lock);
+
+static struct genl_family nl4_genl_family;
+
+static const struct nla_policy nl4_genl_policy[NL4_ATTR_MAX + 1] = {
+	[NL4_ATTR_REMOTE_IPV4] = { .type = NLA_U32 },
+	[NL4_ATTR_SERVICE_SIDE] = { .type = NLA_U8 },
+	[NL4_ATTR_SERVICE_PORT] = { .type = NLA_U16 },
+	[NL4_ATTR_SHARED_KEY] = { .type = NLA_BINARY, .len = NL4_SHARED_KEY_LEN },
+};
 
 static inline u64 nl4_perf_now(void)
 {
@@ -106,50 +128,273 @@ static void nl4_perf_print_one(const char *tag, struct nl4_perf_stats *stats)
 	       atomic64_read(&stats->port_mismatch));
 }
 
-static int nl4_tcp_port_matches(const struct tcphdr *tcph)
+static int nl4_rule_matches_tcp(const struct nl4_rule *rule,
+				const struct tcphdr *tcph, int bound)
 {
-	__be16 port;
-
-	if (encrypt_port == 0)
+	if (rule->service_side == NL4_SERVICE_ALL_PORTS)
 		return 1;
 
-	port = htons((u16)encrypt_port);
-	return tcph->source == port || tcph->dest == port;
+	switch (rule->service_side) {
+	case NL4_SERVICE_REMOTE:
+		return bound == OUTBOUND ? tcph->dest == rule->service_port :
+					   tcph->source == rule->service_port;
+	case NL4_SERVICE_LOCAL:
+		return bound == OUTBOUND ? tcph->source == rule->service_port :
+					   tcph->dest == rule->service_port;
+	default:
+		return 0;
+	}
 }
 
-static int nl4_tcp_port_allowed(struct nl4_perf_stats *stats,
-				const struct tcphdr *tcph)
+static struct nl4_rule *nl4_find_rule(__be32 remote_ip,
+				      const struct tcphdr *tcph, int bound,
+				      struct nl4_perf_stats *stats)
 {
-	if (nl4_tcp_port_matches(tcph))
-		return 1;
+	struct nl4_rule *rule;
+	int ip_match = 0;
 
-	nl4_perf_inc(&stats->port_mismatch);
-	return 0;
+	list_for_each_entry_rcu(rule, &nl4_rule_list, list) {
+		if (rule->remote_ip != remote_ip)
+			continue;
+
+		ip_match = 1;
+		if (nl4_rule_matches_tcp(rule, tcph, bound))
+			return rule;
+	}
+
+	if (ip_match)
+		nl4_perf_inc(&stats->port_mismatch);
+
+	return NULL;
 }
 
-static int nl4_tcp_skb_port_allowed(struct sk_buff *skb, struct iphdr *iph,
-				    struct nl4_perf_stats *stats)
+static struct nl4_rule *nl4_lookup_rule_skb(struct sk_buff *skb,
+					    struct iphdr *iph, int bound,
+					    struct nl4_perf_stats *stats)
 {
 	unsigned int total_len;
 	unsigned int ip_hdr_len;
 	struct tcphdr _tcph;
-	struct tcphdr *tcph;
+	struct tcphdr *tcph = NULL;
+	__be32 remote_ip = (bound == INBOUND) ? iph->saddr : iph->daddr;
 
-	if (encrypt_port == 0 || iph->protocol != IPPROTO_TCP)
-		return 1;
+	if (iph->protocol != IPPROTO_TCP)
+		return NULL;
 
 	total_len = ntohs(iph->tot_len);
 	ip_hdr_len = iph->ihl * 4;
 	if (iph->ihl < 5 || total_len < ip_hdr_len + sizeof(struct tcphdr))
-		return 1;
+		return NULL;
 
 	tcph = skb_header_pointer(skb, skb_network_offset(skb) + ip_hdr_len,
 				  sizeof(_tcph), &_tcph);
 	if (!tcph)
-		return 1;
+		return NULL;
 
-	return nl4_tcp_port_allowed(stats, tcph);
+	return nl4_find_rule(remote_ip, tcph, bound, stats);
 }
+
+static struct nl4_rule *nl4_find_rule_exact(__be32 remote_ip, u8 service_side,
+					    __be16 service_port)
+{
+	struct nl4_rule *rule;
+
+	list_for_each_entry(rule, &nl4_rule_list, list) {
+		if (rule->remote_ip == remote_ip &&
+		    rule->service_side == service_side &&
+		    rule->service_port == service_port)
+			return rule;
+	}
+
+	return NULL;
+}
+
+static void nl4_free_rule_rcu(struct rcu_head *rcu)
+{
+	struct nl4_rule *rule = container_of(rcu, struct nl4_rule, rcu);
+
+	kfree(rule);
+}
+
+static void nl4_delete_rule_locked(struct nl4_rule *rule)
+{
+	list_del_rcu(&rule->list);
+	call_rcu(&rule->rcu, nl4_free_rule_rcu);
+}
+
+static void nl4_flush_rules(void)
+{
+	struct nl4_rule *rule;
+	struct nl4_rule *tmp;
+
+	mutex_lock(&nl4_rule_lock);
+	list_for_each_entry_safe(rule, tmp, &nl4_rule_list, list)
+		nl4_delete_rule_locked(rule);
+	mutex_unlock(&nl4_rule_lock);
+}
+
+static int nl4_fill_rule_msg(struct sk_buff *skb, u32 portid, u32 seq,
+			     int flags, const struct nl4_rule *rule)
+{
+	void *hdr;
+
+	hdr = genlmsg_put(skb, portid, seq, &nl4_genl_family, flags,
+			  NL4_CMD_LIST_RULES);
+	if (!hdr)
+		return -EMSGSIZE;
+
+	if (nla_put_u32(skb, NL4_ATTR_REMOTE_IPV4, (__force u32)rule->remote_ip) ||
+	    nla_put_u8(skb, NL4_ATTR_SERVICE_SIDE, rule->service_side) ||
+	    nla_put_u16(skb, NL4_ATTR_SERVICE_PORT, ntohs(rule->service_port)))
+		goto nla_put_failure;
+
+	genlmsg_end(skb, hdr);
+	return 0;
+
+nla_put_failure:
+	genlmsg_cancel(skb, hdr);
+	return -EMSGSIZE;
+}
+
+static int nl4_genl_add_rule(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nl4_rule *rule;
+	__be32 remote_ip;
+	__be16 service_port;
+	u8 service_side;
+
+	if (!info->attrs[NL4_ATTR_REMOTE_IPV4] ||
+	    !info->attrs[NL4_ATTR_SERVICE_SIDE] ||
+	    !info->attrs[NL4_ATTR_SERVICE_PORT] ||
+	    !info->attrs[NL4_ATTR_SHARED_KEY])
+		return -EINVAL;
+
+	remote_ip = (__force __be32)nla_get_u32(info->attrs[NL4_ATTR_REMOTE_IPV4]);
+	service_side = nla_get_u8(info->attrs[NL4_ATTR_SERVICE_SIDE]);
+	service_port = htons(nla_get_u16(info->attrs[NL4_ATTR_SERVICE_PORT]));
+	if (service_side < NL4_SERVICE_REMOTE ||
+	    service_side > NL4_SERVICE_SIDE_MAX)
+		return -EINVAL;
+	if (service_side != NL4_SERVICE_ALL_PORTS && service_port == 0)
+		return -EINVAL;
+	if (service_side == NL4_SERVICE_ALL_PORTS)
+		service_port = 0;
+
+	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
+	if (!rule)
+		return -ENOMEM;
+
+	rule->remote_ip = remote_ip;
+	rule->service_side = service_side;
+	rule->service_port = service_port;
+	memcpy(rule->shared_key_words, nla_data(info->attrs[NL4_ATTR_SHARED_KEY]),
+	       sizeof(rule->shared_key_words));
+
+	mutex_lock(&nl4_rule_lock);
+	if (nl4_find_rule_exact(remote_ip, service_side, service_port)) {
+		mutex_unlock(&nl4_rule_lock);
+		kfree(rule);
+		return -EEXIST;
+	}
+	list_add_tail_rcu(&rule->list, &nl4_rule_list);
+	mutex_unlock(&nl4_rule_lock);
+
+	return 0;
+}
+
+static int nl4_genl_delete_rule(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nl4_rule *rule;
+	__be32 remote_ip;
+	__be16 service_port;
+	u8 service_side;
+	int ret = -ENOENT;
+
+	if (!info->attrs[NL4_ATTR_REMOTE_IPV4] ||
+	    !info->attrs[NL4_ATTR_SERVICE_SIDE] ||
+	    !info->attrs[NL4_ATTR_SERVICE_PORT])
+		return -EINVAL;
+
+	remote_ip = (__force __be32)nla_get_u32(info->attrs[NL4_ATTR_REMOTE_IPV4]);
+	service_side = nla_get_u8(info->attrs[NL4_ATTR_SERVICE_SIDE]);
+	service_port = htons(nla_get_u16(info->attrs[NL4_ATTR_SERVICE_PORT]));
+	if (service_side < NL4_SERVICE_REMOTE ||
+	    service_side > NL4_SERVICE_SIDE_MAX)
+		return -EINVAL;
+	if (service_side != NL4_SERVICE_ALL_PORTS && service_port == 0)
+		return -EINVAL;
+	if (service_side == NL4_SERVICE_ALL_PORTS)
+		service_port = 0;
+
+	mutex_lock(&nl4_rule_lock);
+	rule = nl4_find_rule_exact(remote_ip, service_side, service_port);
+	if (rule) {
+		nl4_delete_rule_locked(rule);
+		ret = 0;
+	}
+	mutex_unlock(&nl4_rule_lock);
+
+	return ret;
+}
+
+static int nl4_genl_flush_rules(struct sk_buff *skb, struct genl_info *info)
+{
+	nl4_flush_rules();
+	return 0;
+}
+
+static int nl4_genl_dump_rules(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	struct nl4_rule *rule;
+	unsigned long idx = 0;
+	unsigned long start = cb->args[0];
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rule, &nl4_rule_list, list) {
+		if (idx++ < start)
+			continue;
+		if (nl4_fill_rule_msg(skb, NETLINK_CB(cb->skb).portid,
+				      cb->nlh->nlmsg_seq, NLM_F_MULTI,
+				      rule) < 0)
+			break;
+		cb->args[0] = idx;
+	}
+	rcu_read_unlock();
+
+	return skb->len;
+}
+
+static const struct genl_ops nl4_genl_ops[] = {
+	{
+		.cmd = NL4_CMD_ADD_RULE,
+		.flags = GENL_ADMIN_PERM,
+		.doit = nl4_genl_add_rule,
+	},
+	{
+		.cmd = NL4_CMD_DELETE_RULE,
+		.flags = GENL_ADMIN_PERM,
+		.doit = nl4_genl_delete_rule,
+	},
+	{
+		.cmd = NL4_CMD_LIST_RULES,
+		.dumpit = nl4_genl_dump_rules,
+	},
+	{
+		.cmd = NL4_CMD_FLUSH_RULES,
+		.flags = GENL_ADMIN_PERM,
+		.doit = nl4_genl_flush_rules,
+	},
+};
+
+static struct genl_family nl4_genl_family = {
+	.name = NL4_GENL_NAME,
+	.version = NL4_GENL_VERSION,
+	.maxattr = NL4_ATTR_MAX,
+	.policy = nl4_genl_policy,
+	.module = THIS_MODULE,
+	.ops = nl4_genl_ops,
+	.n_ops = ARRAY_SIZE(nl4_genl_ops),
+};
 
 static void nl4_log_tcp(const char *tag, struct iphdr *iph,
 	struct tcphdr *tcph, unsigned int total_len,
@@ -307,6 +552,7 @@ static int nl4_prepare_skb(struct sk_buff *skb, struct nl4_perf_stats *stats)
 
 static int nl4_tcp_gso_fast_path(struct sk_buff *skb,
 				 struct nl4_perf_stats *stats,
+				 const u32 key_words[NL4_SHARED_KEY_WORDS],
 				 int enc, const char *tag)
 {
 	unsigned int total_len;
@@ -390,7 +636,8 @@ static int nl4_tcp_gso_fast_path(struct sk_buff *skb,
 	payload = (char *)tcph + tcp_hdr_len;
 	nl4_perf_inc(&stats->packets);
 	nl4_perf_add_count(&stats->bytes, payload_len);
-	ret = nl4_tcp_crypto_cipher(payload, payload_len, iph, tcph, enc);
+	ret = nl4_tcp_crypto_cipher(payload, payload_len, iph, tcph,
+				    key_words, enc);
 	if (ret != 0) {
 		nl4_perf_inc(&stats->gso_drop);
 		return ret;
@@ -418,15 +665,6 @@ static struct nf_hook_ops nfhk_local_out =
 	.priority = NF_IP_PRI_FIRST
 };
 
-int remoteAllowed(struct iphdr *iph, int bound)
-{
-	u32 tmp_addr = (bound==INBOUND)?iph->saddr:iph->daddr;
-	if (tmp_addr==remote_addr)
-		return 1;
-	else
-		return 0;
-}
-
 unsigned int nf_hookfn_in(void *priv,
 			       struct sk_buff *skb,
 			       const struct nf_hook_state *state)
@@ -438,6 +676,8 @@ unsigned int nf_hookfn_in(void *priv,
 	char* payload;
 	struct iphdr *iph = NULL;
 	void *l4_hdr = NULL;
+	struct nl4_rule *rule;
+	u32 key_words[NL4_SHARED_KEY_WORDS];
 	u8 proto;
 	int ret;
 	u64 hook_start = nl4_perf_now();
@@ -445,16 +685,21 @@ unsigned int nf_hookfn_in(void *priv,
     // struct tcphdr *tcph = NULL;
 
 	iph = ip_hdr(skb);
-	if (iph == NULL || !remoteAllowed(iph, INBOUND))
+	if (iph == NULL)
 		goto out_accept;
 	proto = iph->protocol;
-	if (proto == IPPROTO_TCP &&
-	    !nl4_tcp_skb_port_allowed(skb, iph, &nl4_perf_in))
+	rcu_read_lock();
+	rule = nl4_lookup_rule_skb(skb, iph, INBOUND, &nl4_perf_in);
+	if (!rule) {
+		rcu_read_unlock();
 		goto out_accept;
+	}
+	memcpy(key_words, rule->shared_key_words, sizeof(key_words));
+	rcu_read_unlock();
 
 	if (proto == IPPROTO_TCP && skb_is_gso(skb)) {
 		step_start = nl4_perf_now();
-		ret = nl4_tcp_gso_fast_path(skb, &nl4_perf_in, DECRYPTION,
+		ret = nl4_tcp_gso_fast_path(skb, &nl4_perf_in, key_words, DECRYPTION,
 					    "in gso stream");
 		nl4_perf_add_ns(&nl4_perf_in.crypto_ns, step_start);
 		if (ret != 0) {
@@ -491,9 +736,6 @@ unsigned int nf_hookfn_in(void *priv,
 			goto out_accept;
 		if (total_len < ip_hdr_len + l4_hdr_len)
 			goto out_accept;
-		if (iph->protocol == IPPROTO_TCP &&
-		    !nl4_tcp_port_allowed(&nl4_perf_in, l4_hdr))
-			goto out_accept;
 
 		//a. extract cipher payload (exclude L4 header)
 		data_len = total_len - ip_hdr_len - l4_hdr_len;
@@ -512,7 +754,7 @@ unsigned int nf_hookfn_in(void *priv,
 			nl4_perf_add_count(&nl4_perf_in.bytes, data_len);
 			step_start = nl4_perf_now();
 			ret = nl4_tcp_crypto_cipher(payload, data_len, iph, l4_hdr,
-						    DECRYPTION);
+						    key_words, DECRYPTION);
 			nl4_perf_add_ns(&nl4_perf_in.crypto_ns, step_start);
 			if (ret != 0) {
 				printk_ratelimited(KERN_LOG
@@ -526,7 +768,7 @@ unsigned int nf_hookfn_in(void *priv,
 		} else {
 			ret = nl4_crypto_cipher(payload, data_len, DECRYPTION);
 			if (ret != 0)
-				return NF_ACCEPT;
+				goto out_accept;
 		}
 
 		//c. re-checksum for L4 and IP
@@ -553,6 +795,8 @@ unsigned int nf_hookfn_out(void *priv,
 	char* payload;
 	struct iphdr *iph = NULL;
 	void *l4_hdr = NULL;
+	struct nl4_rule *rule;
+	u32 key_words[NL4_SHARED_KEY_WORDS];
 	u8 proto;
 	int ret;
 	u64 hook_start = nl4_perf_now();
@@ -560,16 +804,21 @@ unsigned int nf_hookfn_out(void *priv,
 	// struct tcphdr *tcph = NULL;
 
 	iph = ip_hdr(skb);
-	if (iph == NULL || !remoteAllowed(iph, OUTBOUND))
+	if (iph == NULL)
 		goto out_accept;
 	proto = iph->protocol;
-	if (proto == IPPROTO_TCP &&
-	    !nl4_tcp_skb_port_allowed(skb, iph, &nl4_perf_out))
+	rcu_read_lock();
+	rule = nl4_lookup_rule_skb(skb, iph, OUTBOUND, &nl4_perf_out);
+	if (!rule) {
+		rcu_read_unlock();
 		goto out_accept;
+	}
+	memcpy(key_words, rule->shared_key_words, sizeof(key_words));
+	rcu_read_unlock();
 
 	if (proto == IPPROTO_TCP && skb_is_gso(skb)) {
 		step_start = nl4_perf_now();
-		ret = nl4_tcp_gso_fast_path(skb, &nl4_perf_out, ENCRYPTION,
+		ret = nl4_tcp_gso_fast_path(skb, &nl4_perf_out, key_words, ENCRYPTION,
 					    "out gso stream");
 		nl4_perf_add_ns(&nl4_perf_out.crypto_ns, step_start);
 		if (ret != 0) {
@@ -606,9 +855,6 @@ unsigned int nf_hookfn_out(void *priv,
 			goto out_accept;
 		if (total_len < ip_hdr_len + l4_hdr_len)
 			goto out_accept;
-		if (iph->protocol == IPPROTO_TCP &&
-		    !nl4_tcp_port_allowed(&nl4_perf_out, l4_hdr))
-			goto out_accept;
 
 		//a. encrypt payload in place without resizing skb
 		payload_len = total_len - ip_hdr_len - l4_hdr_len;
@@ -631,7 +877,8 @@ unsigned int nf_hookfn_out(void *priv,
 			nl4_perf_add_count(&nl4_perf_out.bytes, payload_len);
 			step_start = nl4_perf_now();
 			ret = nl4_tcp_crypto_cipher(payload, payload_len, iph,
-						    l4_hdr, ENCRYPTION);
+						    l4_hdr, key_words,
+						    ENCRYPTION);
 			nl4_perf_add_ns(&nl4_perf_out.crypto_ns, step_start);
 			if (ret != 0) {
 				printk_ratelimited(KERN_LOG
@@ -643,7 +890,7 @@ unsigned int nf_hookfn_out(void *priv,
 		} else {
 			ret = nl4_crypto_cipher(payload, payload_len, ENCRYPTION);
 			if (ret != 0)
-				return NF_ACCEPT;
+				goto out_accept;
 		}
 
 		//c. re-checksum for L4 and IP
@@ -663,23 +910,23 @@ static int nl4_init(void)
 {
 	unsigned int ret;
 
-	if (encrypt_port < 0 || encrypt_port > 65535) {
-		printk(KERN_LOG "invalid encrypt_port=%d, expected 0-65535\n",
-		       encrypt_port);
-		return -EINVAL;
-	}
-
-	remote_addr = IP2NUM(REMOTE_IP);
-
 	ret = nl4_crypto_init();
 	if (ret < 0) {
 		printk(KERN_LOG "Crypto Init Error.\n");
 		return ret;
 	}
 
+	ret = genl_register_family(&nl4_genl_family);
+	if (ret < 0) {
+		printk(KERN_LOG "Generic Netlink Register Error.\n");
+		nl4_crypto_exit();
+		return ret;
+	}
+
 	ret = nf_register_net_hook(&init_net, &nfhk_local_in);
 	if (ret < 0) {
         printk("INBOUND Module Register Error.\n");
+		genl_unregister_family(&nl4_genl_family);
 		nl4_crypto_exit();
         return ret;
     }
@@ -688,6 +935,7 @@ static int nl4_init(void)
 	if (ret < 0) {
         printk("OUTBOUND Module Register Error.\n");
 		nf_unregister_net_hook(&init_net, &nfhk_local_in);
+		genl_unregister_family(&nl4_genl_family);
 		nl4_crypto_exit();
         return ret;
     }
@@ -700,6 +948,8 @@ static void nl4_fini(void)
 {
 	nf_unregister_net_hook(&init_net, &nfhk_local_in);
 	nf_unregister_net_hook(&init_net, &nfhk_local_out);
+	genl_unregister_family(&nl4_genl_family);
+	nl4_flush_rules();
 	if (nl4_perf) {
 		nl4_perf_print_one("OUT", &nl4_perf_out);
 		nl4_perf_print_one("IN", &nl4_perf_in);
