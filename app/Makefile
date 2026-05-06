@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS ?= -Wall -Wextra -O2
 CPPFLAGS += -I../include -I/usr/include/libnl3
-LDLIBS += -lnl-genl-3 -lnl-3
+LDLIBS += -lnl-genl-3 -lnl-3 -lcrypto
 
 all: nl4enc
 

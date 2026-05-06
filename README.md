@@ -12,20 +12,28 @@ Just imagine that the intermediate routers could not know what you are actually 
 
 > *NEED UPDATE IN THE FUTURE*
 
-## Runtime options
+## Runtime usage
 
-The kernel module keeps the current hardcoded peer address and key, but can
-limit TCP payload encryption/decryption to one TCP service port:
+Build both the kernel module and user-space control app:
 
 ```sh
-sudo insmod nl4_bypass.ko encrypt_port=8081
+make
 ```
 
-`encrypt_port=0` is the default and processes all TCP ports for the configured
-peer. `encrypt_port=N` only applies to TCP traffic where the source or
-destination port equals `N`; non-TCP handling is unchanged. For remote SSH
-management, use a demo service port such as `8081` or `8082` so SSH port `22`
-is bypassed.
+Rules are configured locally in `/etc/nl4enc/rules.json`; `rule add`,
+`delete`, `list`, and `flush` do not require the kernel module to be loaded.
+Use `apply` to sync the saved rules to the module:
+
+```sh
+sudo app/nl4enc rule add <remote-ip> --psk <psk> --remote-service 8081 --src-ip <local-ip>
+sudo app/nl4enc on
+sudo app/nl4enc apply
+```
+
+`remote-service` matches traffic to a service running on the remote host,
+`local-service` matches traffic to a service running locally, and `all-ports`
+matches all TCP payloads between the two hosts. `--key <64hex>` is still
+available as a debug/advanced alternative to `--psk`.
 
 ## TODO
 
