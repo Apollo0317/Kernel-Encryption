@@ -229,3 +229,18 @@ Not implemented as production features:
 - NAT traversal
 - IPv6
 - production security guarantees
+
+## Acknowledgements
+
+This project is based on and extends the GPL-licensed project [Netfilter-L4-Encryption](https://github.com/iamhyc/Netfilter-L4-Encryption.git) by `iamhyc`.
+
+Major changes in this fork include:
+- Adapt the module to Linux kernel 6.8+ 
+- change the encryption suit to stream cipher to avoid tcp sequence number issues
+- Updated the kernel packet transformation path and solve GSO problem
+- Added/extended the `nl4enc` user-space CLI
+- Added Generic Netlink-based rule synchronization
+- Added PSK-based key derivation and persistent rule configuration
+- Validated the module on WSL2 Ubuntu 24.04 and Raspberry Pi 5 ARMv8
+
+This repository preserves the original GPL license and copyright notices.
